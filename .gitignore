@@ -1,0 +1,15 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# 数据与生成目录
+lancedb/
+.gradio/
+
+# IDE 与日志
+.idea/
+.vscode/
+chat_history.json
