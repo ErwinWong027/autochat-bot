@@ -44,7 +44,7 @@ def load_settings() -> Settings:
         premium_model=os.getenv("PREMIUM_MODEL", "qwen3.7-max"),
         profile_vision_model=os.getenv("PROFILE_VISION_MODEL", "qwen3-vl-plus"),
         profile_ocr_model=os.getenv("PROFILE_OCR_MODEL", "qwen-vl-ocr-latest"),
-        auto_send_enabled=os.getenv("AUTO_SEND_ENABLED", "false").lower() == "true",
+        auto_send_enabled=os.getenv("AUTO_SEND_ENABLED", "true").lower() == "true",
         browser_agent_target_url=os.getenv("BROWSER_AGENT_TARGET_URL", ""),
         browser_agent_poll_seconds=int(os.getenv("BROWSER_AGENT_POLL_SECONDS", "5")),
         bumble_target_url=os.getenv("BUMBLE_TARGET_URL", "https://bumble.com/app/connections"),

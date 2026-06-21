@@ -83,6 +83,15 @@ class MemoryStore:
                     created_at text not null
                 );
                 create index if not exists idx_sent_messages_created on sent_messages(created_at);
+                create table if not exists draft_cache (
+                    message_hash text primary key,
+                    contact_id   text not null,
+                    incoming     text not null,
+                    draft        text not null,
+                    created_at   text not null,
+                    updated_at   text not null
+                );
+                create index if not exists idx_draft_cache_contact on draft_cache(contact_id, updated_at);
                 """
             )
             self._ensure_contact_columns(conn)
@@ -300,6 +309,50 @@ class MemoryStore:
                 (hash, contact_id, now),
             )
 
+    def cache_draft(self, message_hash: str, contact_id: str, incoming: str, draft: str) -> None:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                insert into draft_cache(message_hash, contact_id, incoming, draft, created_at, updated_at)
+                values (?, ?, ?, ?, ?, ?)
+                on conflict(message_hash) do update set
+                    contact_id=excluded.contact_id,
+                    incoming=excluded.incoming,
+                    draft=excluded.draft,
+                    updated_at=excluded.updated_at
+                """,
+                (message_hash, contact_id, incoming, draft, now, now),
+            )
+
+    def get_cached_draft(self, message_hash: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "select draft from draft_cache where message_hash = ?",
+                (message_hash,),
+            ).fetchone()
+        return str(row["draft"]) if row else ""
+
+    def recover_draft_for_message(self, message_hash: str, contact_id: str) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                select m2.content
+                from messages m1
+                join messages m2
+                  on m2.conversation_id = m1.conversation_id
+                 and m2.id > m1.id
+                 and m2.role = 'draft'
+                where m1.contact_id = ?
+                  and m1.message_id = ?
+                  and m1.role = 'user'
+                order by m2.id asc
+                limit 1
+                """,
+                (contact_id, message_hash),
+            ).fetchone()
+        return str(row["content"]) if row else ""
+
     def load_sent_hashes(self, since_days: int = 7) -> set[str]:
         cutoff = (datetime.now() - timedelta(days=since_days)).isoformat()
         with self._connect() as conn:
@@ -308,6 +361,101 @@ class MemoryStore:
                 (cutoff,),
             ).fetchall()
         return {row["hash"] for row in rows}
+
+    def contact_overview(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            counts = conn.execute(
+                """
+                select
+                    count(distinct contact_id) as contact_count,
+                    count(*) as message_count,
+                    sum(case when role in ('assistant', 'draft') then 1 else 0 end) as reply_count
+                from messages
+                """
+            ).fetchone()
+            sent = conn.execute("select count(*) as sent_count from sent_messages").fetchone()
+        return {
+            "contact_count": int(counts["contact_count"] or 0),
+            "message_count": int(counts["message_count"] or 0),
+            "reply_count": int(counts["reply_count"] or 0),
+            "sent_count": int(sent["sent_count"] or 0),
+        }
+
+    def list_contacts(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                select
+                    c.contact_id,
+                    c.display_name,
+                    c.identity,
+                    c.profile,
+                    c.relationship_stage,
+                    c.recent_emotion,
+                    c.interaction_frequency,
+                    c.updated_at,
+                    coalesce(stats.channel, '') as channel,
+                    coalesce(stats.message_count, 0) as message_count,
+                    coalesce(stats.reply_count, 0) as reply_count,
+                    stats.last_message,
+                    stats.last_message_at
+                from contacts c
+                left join (
+                    select
+                        m.contact_id,
+                        max(m.channel) as channel,
+                        count(*) as message_count,
+                        sum(case when m.role in ('assistant', 'draft') then 1 else 0 end) as reply_count,
+                        (
+                            select content from messages lm
+                            where lm.contact_id = m.contact_id
+                            order by lm.id desc limit 1
+                        ) as last_message,
+                        max(m.created_at) as last_message_at
+                    from messages m
+                    group by m.contact_id
+                ) stats on stats.contact_id = c.contact_id
+                order by stats.last_message_at desc, c.updated_at desc
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_contact_detail(self, contact_id: str) -> dict[str, Any]:
+        profile = self.get_contact_profile(contact_id)
+        with self._connect() as conn:
+            conversations = conn.execute(
+                """
+                select conversation_id, contact_id, channel, created_at, updated_at
+                from conversations
+                where contact_id = ?
+                order by updated_at desc
+                """,
+                (contact_id,),
+            ).fetchall()
+            messages = conn.execute(
+                """
+                select id, conversation_id, contact_id, channel, message_id, role, content, technique, decision_reason, created_at
+                from messages
+                where contact_id = ?
+                order by id asc
+                """,
+                (contact_id,),
+            ).fetchall()
+            cached = conn.execute(
+                """
+                select message_hash, incoming, draft, created_at, updated_at
+                from draft_cache
+                where contact_id = ?
+                order by updated_at desc limit 20
+                """,
+                (contact_id,),
+            ).fetchall()
+        return {
+            **profile,
+            "conversations": [dict(row) for row in conversations],
+            "messages": [dict(row) for row in messages],
+            "draft_cache": [dict(row) for row in cached],
+        }
 
     def get_contact_profile(self, contact_id: str) -> dict[str, Any]:
         with self._connect() as conn:

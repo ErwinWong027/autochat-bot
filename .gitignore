@@ -4,6 +4,9 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
+node_modules/
+frontend/dist/
+.codex-logs/
 
 # 数据与生成目录
 lancedb/

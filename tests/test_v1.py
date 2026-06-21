@@ -82,6 +82,18 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(conflict[0]["status"], "conflict")
             self.assertEqual(profile["fields"]["hometown"]["value"], "杭州")
 
+    def test_draft_cache_and_recover_from_message_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "memory.db")
+            store = MemoryStore(db_path)
+            store.cache_draft("hash-1", "bumble:a", "你好", "回你好")
+            self.assertEqual(store.get_cached_draft("hash-1"), "回你好")
+
+            conversation_id = store.get_or_create_conversation("bumble:a", "bumble")
+            store.add_message(conversation_id, "bumble:a", "bumble", "user", "旧消息", message_id="hash-2")
+            store.add_message(conversation_id, "bumble:a", "bumble", "draft", "旧草稿", message_id="hash-2")
+            self.assertEqual(store.recover_draft_for_message("hash-2", "bumble:a"), "旧草稿")
+
 
 class StyleTests(unittest.TestCase):
     def test_style_rejects_ai_long_reply(self):
@@ -278,8 +290,57 @@ class BumbleTests(unittest.TestCase):
         self.assertEqual(service.calls[0].contact_id, "bumble:abc")
         self.assertEqual(service.calls[0].message_id, bumble_message_hash("bumble:abc", "第一条"))
         duplicate = connector._create_reply_group("bumble:abc", [BumbleMessage("in", "第一条", 3)])
-        self.assertEqual(duplicate, [])
-        self.assertEqual(connector.status()["skipped_duplicate_count"], 1)
+        self.assertEqual([item["draft"] for item in duplicate], ["回1"])
+        self.assertEqual(len(service.calls), 3)
+
+    def test_bumble_sent_message_is_skipped_but_cached_unsent_is_reused(self):
+        class FakeService:
+            def __init__(self, memory):
+                self.memory = memory
+                self.calls = []
+
+            def create_draft(self, request):
+                self.calls.append(request)
+                return {"draft": f"回{len(self.calls)}"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(os.path.join(tmp, "memory.db"))
+            service = FakeService(store)
+            connector = BumbleConnector(service)
+            first = connector._create_reply_group("bumble:abc", [BumbleMessage("in", "第一条", 0)])
+            self.assertEqual(first[0]["draft"], "回1")
+            self.assertEqual(store.load_sent_hashes(), set())
+            again = connector._create_reply_group("bumble:abc", [BumbleMessage("in", "第一条", 1)])
+            self.assertEqual(again[0]["draft"], "回1")
+            self.assertEqual(len(service.calls), 1)
+
+            input_box = type("FakeInput", (), {"fill": lambda self, text: None, "press": lambda self, key: None})()
+            sent = connector._fill_or_send_reply_group(input_box, again, auto_send=True, contact_id="bumble:abc")
+            self.assertEqual(sent, 1)
+            skipped = connector._create_reply_group("bumble:abc", [BumbleMessage("in", "第一条", 2)])
+            self.assertEqual(skipped, [])
+            self.assertEqual(connector.status()["skipped_duplicate_count"], 1)
+
+    def test_bumble_stale_sent_marker_does_not_hide_pending_cached_draft(self):
+        class FakeService:
+            def __init__(self, memory):
+                self.memory = memory
+                self.calls = []
+
+            def create_draft(self, request):
+                self.calls.append(request)
+                return {"draft": "新草稿"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(os.path.join(tmp, "memory.db"))
+            message_id = bumble_message_hash("bumble:abc", "旧消息")
+            store.mark_sent(message_id, "bumble:abc")
+            store.cache_draft(message_id, "bumble:abc", "旧消息", "旧草稿")
+
+            connector = BumbleConnector(FakeService(store))
+            replies = connector._create_reply_group("bumble:abc", [BumbleMessage("in", "旧消息", 0)])
+            self.assertEqual([item["draft"] for item in replies], ["旧草稿"])
+            self.assertEqual(connector.service.calls, [])
 
     def test_bumble_fill_or_send_uses_enter_not_send_button(self):
         class FakeInput:
@@ -303,6 +364,53 @@ class BumbleTests(unittest.TestCase):
         sent = connector._fill_or_send_reply_group(input_box, replies, auto_send=False)
         self.assertEqual(sent, 0)
         self.assertEqual(input_box.actions, [("fill", "一")])
+
+    def test_bumble_action_contact_candidates_returns_all_turn_contacts(self):
+        class FakeText:
+            def __init__(self, text):
+                self.text = text
+
+            def inner_text(self, timeout=1000):
+                return self.text
+
+        class FakeItem:
+            def __init__(self, uid, name, move_text):
+                self.attrs = {"data-qa-uid": uid, "data-qa-name": name}
+                self.move_text = move_text
+
+            def locator(self, selector):
+                return FakeText(self.move_text)
+
+            def get_attribute(self, name):
+                return self.attrs.get(name, "")
+
+        class FakeLocator:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class FakePage:
+            def __init__(self, items):
+                self.items = items
+
+            def locator(self, selector):
+                return FakeLocator(self.items)
+
+        connector = BumbleConnector(type("FakeService", (), {})())
+        page = FakePage(
+            [
+                FakeItem("a", "A", "Your move"),
+                FakeItem("b", "B", "Conversation expired"),
+                FakeItem("c", "C", "轮到您了"),
+            ]
+        )
+        candidates = connector._action_contact_candidates(page)
+        self.assertEqual([item["uid"] for item in candidates], ["a", "c"])
 
     def test_bumble_contact_id_and_hash_are_stable(self):
         self.assertEqual(bumble_contact_id("abc"), "bumble:abc")

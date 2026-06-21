@@ -1,6 +1,6 @@
 # 社交策略数字分身 v1 使用说明书
 
-结论：本项目包含手动草稿模式和 Bumble Agent。手动模式只生成草稿；Bumble Agent 在双开关允许时会按 Enter 自动发送。
+结论：本项目包含手动草稿模式和 Bumble Agent。手动模式只生成草稿；Bumble Agent 默认按 Enter 自动发送，可在界面关闭。
 
 ## 1. 环境准备
 
@@ -32,7 +32,7 @@ CHEAP_MODEL=qwen3.6-flash
 PREMIUM_MODEL=qwen3.7-max
 PROFILE_VISION_MODEL=qwen3-vl-plus
 PROFILE_OCR_MODEL=qwen-vl-ocr-latest
-AUTO_SEND_ENABLED=false
+AUTO_SEND_ENABLED=true
 BROWSER_AGENT_TARGET_URL=
 BROWSER_AGENT_POLL_SECONDS=5
 BUMBLE_TARGET_URL=https://eu1.bumble.com/app/connections
@@ -142,25 +142,27 @@ curl -X POST http://localhost:8000/draft \
 - `style_issues`：风格审查结果
 - `profile_updates`：本轮对话自动补全/更新的画像信息
 
-## 5. 运行 Gradio 调试界面
+## 5. 运行前端控制台
 
 ```bash
-python digital_twin.py
+cd frontend
+npm install
+npm run dev
 ```
 
 浏览器打开：
 
 ```text
-http://localhost:7860
+http://localhost:5173
 ```
 
-Gradio 适合手动输入联系人信息和对方消息，检查草稿、策略、召回案例和风格问题。
+前端控制台适合启动 Bumble Agent、查看联系人画像、检查完整消息记录、草稿、策略和 Agent 日志。
 
-Gradio 里有三个区域：
+控制台有三个区域：
 
-- `画像分析`：上传主页截图或粘贴主页文字，生成联系人画像
-- `回复草稿`：输入对方消息，生成回复草稿，并自动更新画像
-- `浏览器Agent`：配置网页选择器，启动/停止网页自动回复
+- `ABOUT`：产品介绍、起源、使用方法和功能说明
+- `浏览器Agent`：启动/停止 Bumble Agent，查看阶段、计数和日志
+- `联系人看板`：按联系人查看 ID、渠道、简介、画像、消息记录和 AI 回复策略
 
 ## 6. Bumble 专用 Agent
 
@@ -168,7 +170,7 @@ Bumble 专用 Agent 不需要手动填写 CSS 选择器。它会使用 `BUMBLE_U
 
 第一次使用：
 
-1. 在 Gradio 的 `浏览器Agent` → `Bumble专用` 输入 `https://eu1.bumble.com/app/connections`。
+1. 在前端控制台的 `浏览器Agent` 输入 `https://eu1.bumble.com/app/connections`。
 2. 点击 `启动 Bumble Agent`。
 3. 系统会打开一个新的自动化 Chromium 窗口。
 4. 在这个新窗口里手动登录 Bumble。
@@ -179,7 +181,7 @@ Bumble 专用 Agent 不需要手动填写 CSS 选择器。它会使用 `BUMBLE_U
 识别规则：
 
 - 联系人：`data-qa-role="contact"`
-- 需要回复：联系人里出现 `.contact__move-label`，且文字包含 `轮到您了`
+- 需要回复：联系人里出现 `.contact__move-label`，且文字包含 `轮到您了`、`Your move` 或 `your turn`
 - 联系人 ID：`bumble:{data-qa-uid}`
 - 联系人名称：`data-qa-name`
 - 最新消息组：最后一条 `message--out` 后面的所有 `message--in`
@@ -191,7 +193,7 @@ Bumble 专用 Agent 不需要手动填写 CSS 选择器。它会使用 `BUMBLE_U
 ```bash
 curl -X POST http://localhost:8000/agent/bumble/run \
   -H "Content-Type: application/json" \
-  -d '{"target_url":"https://eu1.bumble.com/app/connections","auto_send_enabled":false,"poll_seconds":5}'
+  -d '{"target_url":"https://eu1.bumble.com/app/connections","auto_send_enabled":true,"poll_seconds":5}'
 ```
 
 查看状态：
@@ -222,6 +224,10 @@ curl -X POST http://localhost:8000/agent/bumble/stop
 
 自动发送由两个条件共同控制：`.env` 的 `AUTO_SEND_ENABLED=true`，以及启动 Bumble Agent 时 `auto_send_enabled=true`。关闭自动发送时只把第一条草稿填入输入框，不按 Enter。
 
+草稿和发送状态是分开的：生成草稿会写入 `draft_cache`，只有真正按 Enter 后才写入 `sent_messages`。如果旧消息仍显示为 `in`、联系人仍是 `Your move`、且没有我方新的 `out`，Agent 会优先发送缓存草稿；找不到缓存才重新生成。
+
+多联系人处理会扫描所有 `Your move / your turn / 轮到您了` 联系人。当前联系人无可发送内容或发送完成后，会继续处理下一个候选联系人。
+
 ## 7. 添加其他身份对话
 
 把额外对话放到 `persona_dialogues/*.json`。
@@ -249,7 +255,7 @@ curl -X POST http://localhost:8000/agent/bumble/stop
 不消耗 API：
 
 ```bash
-python3 -m py_compile app.py digital_twin.py digital_twin4.py social_twin/*.py tests/test_v1.py
+python3 -m py_compile app.py social_twin/*.py tests/test_v1.py
 python3 -m unittest
 ```
 
@@ -277,8 +283,8 @@ PY
 ## 9. 当前边界
 
 - 手动回复区只生成草稿
-- Bumble Agent 在 `AUTO_SEND_ENABLED=true` 且界面/API 允许自动发送时会发送
-- 浏览器 Agent 可全自动发送，但必须设置 `AUTO_SEND_ENABLED=true`
+- Bumble Agent 默认在 `AUTO_SEND_ENABLED=true` 且界面/API 允许自动发送时发送
+- 浏览器 Agent 可全自动发送，默认配置为 `AUTO_SEND_ENABLED=true`
 - Bumble Agent 只适配 Bumble Web，不适配手机 App
 - 浏览器 Agent 需要网页 CSS 选择器和 Playwright Chromium
 - 真实生成草稿会调用 DashScope 并消耗 API

@@ -32,6 +32,7 @@ STAGE_CODES = {
     "NO_CONTACT": 204,
     "CONTACT_FOUND": 210,
     "CONTACT_OPENED": 220,
+    "CONTACT_MISMATCH": 221,
     "PROFILE_CHECKING": 300,
     "PROFILE_SKIPPED": 304,
     "PROFILE_READ": 310,
@@ -41,10 +42,14 @@ STAGE_CODES = {
     "NO_PENDING_GROUP": 411,
     "DRAFTING": 500,
     "DRAFT_ITEM_START": 501,
+    "DRAFT_CACHED": 502,
     "DRAFT_FAILED": 509,
     "DRAFTED": 510,
+    "SKIPPED_ALREADY_SENT": 520,
+    "NO_UNSENT_DRAFT": 521,
     "FILLED_TEXTAREA": 600,
     "SENT_BY_ENTER": 610,
+    "SEND_NOT_CONFIRMED": 611,
     "IDLE": 700,
     "STOPPED": 800,
     "ERROR": 900,
@@ -446,9 +451,12 @@ class BumbleConnector:
         self._thread: threading.Thread | None = None
         memory = getattr(self.service, "memory", None)
         if memory is not None and hasattr(memory, "load_sent_hashes"):
-            self._seen_messages: set[str] = memory.load_sent_hashes(since_days=7)
+            self._sent_messages: set[str] = memory.load_sent_hashes(since_days=7)
         else:
-            self._seen_messages = set()
+            self._sent_messages = set()
+        self._draft_cache: dict[str, str] = {}
+        self._sent_message_at: dict[str, float] = {}
+        self._contact_processed_at: dict[str, float] = {}
         self._status: dict[str, Any] = self._initial_status()
 
     def _initial_status(self) -> dict[str, Any]:
@@ -566,80 +574,38 @@ class BumbleConnector:
                 self._set_stage("PAGE_READY", "Bumble 页面已打开", data={"target_url": target_url})
                 while not self._stop.is_set():
                     self._set_stage("SCANNING_CONTACTS", "扫描轮到您了联系人")
-                    contact = self._first_action_contact(page)
-                    if contact is None:
+                    candidates = self._action_contact_candidates(page)
+                    if not candidates:
                         self._set_stage("NO_CONTACT", "未找到轮到您了联系人", data={"contact_count": self._status["contact_count"]})
                         time.sleep(poll_seconds)
                         continue
-                    uid = contact.get_attribute("data-qa-uid") or "bumble_unknown"
-                    contact_id = bumble_contact_id(uid)
-                    name = contact.get_attribute("data-qa-name") or uid
-                    self._update_contact_status(contact_id, name=name, stage="CONTACT_FOUND")
-                    self._set_stage("CONTACT_FOUND", "找到待回复联系人", data={"contact_id": contact_id, "name": name})
-                    self._open_contact(contact)
-                    time.sleep(0.8)
-                    self._update_contact_status(contact_id, stage="CONTACT_OPENED")
-                    self._set_stage("CONTACT_OPENED", "已打开联系人会话", data={"contact_id": contact_id, "name": name})
-                    self.service.memory.upsert_contact(contact_id=contact_id, display_name=name)
-                    input_box = page.locator(INPUT_SELECTOR).first
-                    self._fill_progress(input_box, "正在读取 profile 生成画像中，请等待……")
-                    profile_updates = self._ensure_profile(page, contact_id, name, config.refresh_profile)
-                    self._fill_progress(input_box, "正在分析对话中，请等待……")
-                    pending_group = self._pending_incoming_group(page)
-                    self._status["pending_group_count"] = len(pending_group)
-                    self._update_contact_status(
-                        contact_id,
-                        message_count=self._status["message_count"],
-                        last_out_index=self._status["last_out_index"],
-                        pending_group_count=len(pending_group),
-                        pending_group=[item.text for item in pending_group],
-                    )
-                    if not pending_group:
-                        self._update_contact_status(contact_id, stage="NO_PENDING_GROUP")
-                        self._set_stage(
-                            "NO_PENDING_GROUP",
-                            "没有待回复消息组",
-                            data={
-                                "message_count": self._status["message_count"],
-                                "last_out_index": self._status["last_out_index"],
-                            },
-                        )
+                    processed = False
+                    for candidate in candidates:
+                        if self._stop.is_set():
+                            break
+                        contact = page.locator(ACTION_CONTACT_SELECTOR).nth(candidate["index"])
+                        uid = candidate["uid"] or contact.get_attribute("data-qa-uid") or "bumble_unknown"
+                        contact_id = bumble_contact_id(uid)
+                        name = candidate["name"] or contact.get_attribute("data-qa-name") or uid
+                        cooldown_seconds = max(30, poll_seconds * 2)
+                        last_processed = self._contact_processed_at.get(contact_id, 0)
+                        if time.time() - last_processed < cooldown_seconds:
+                            self._log(
+                                "SCANNING_CONTACTS",
+                                "联系人刚处理过，本轮跳过",
+                                data={"contact_id": contact_id, "name": name},
+                            )
+                            continue
+                        completed = self._process_contact(page, contact, contact_id, name, config.refresh_profile, auto_send)
+                        if completed:
+                            self._contact_processed_at[contact_id] = time.time()
+                        else:
+                            self._stop.set()
+                        processed = True
+                        break
+                    if not processed:
                         time.sleep(poll_seconds)
                         continue
-                    self._set_stage(
-                        "PENDING_GROUP_FOUND",
-                        f"找到 {len(pending_group)} 条待回复 incoming",
-                        data={"pending_group": [item.text for item in pending_group]},
-                    )
-                    self._update_contact_status(contact_id, stage="DRAFTING")
-                    self._set_stage("DRAFTING", "开始逐条生成草稿", data={"pending_group_count": len(pending_group)})
-                    reply_group = self._create_reply_group(contact_id, pending_group, input_box)
-                    if not reply_group:
-                        self._update_contact_status(contact_id, stage="IDLE")
-                        self._set_stage("IDLE", "待回复消息都已处理过，跳过")
-                        time.sleep(poll_seconds)
-                        continue
-                    self._update_contact_status(contact_id, stage="DRAFTED", last_reply_group=reply_group)
-                    self._set_stage("DRAFTED", f"生成 {len(reply_group)} 条草稿")
-                    self._status.update(
-                        {
-                            "last_contact_id": contact_id,
-                            "last_contact_name": name,
-                            "last_message": reply_group[-1]["incoming"],
-                            "last_draft": reply_group[-1]["draft"],
-                            "last_reply_group": reply_group,
-                            "profile_updates": profile_updates,
-                            "draft_count": int(self._status.get("draft_count", 0)) + len(reply_group),
-                        }
-                    )
-                    sent = self._fill_or_send_reply_group(input_box, reply_group, auto_send)
-                    self._status["sent_count"] = int(self._status.get("sent_count", 0)) + sent
-                    if sent:
-                        self._update_contact_status(contact_id, stage="SENT_BY_ENTER", sent_count=sent)
-                        self._set_stage("SENT_BY_ENTER", f"已按 Enter 发送 {sent} 条")
-                    else:
-                        self._update_contact_status(contact_id, stage="FILLED_TEXTAREA", sent_count=0)
-                        self._set_stage("FILLED_TEXTAREA", "自动发送关闭，只填入第一条草稿")
                     time.sleep(poll_seconds)
                 browser.close()
         except Exception as exc:
@@ -649,11 +615,107 @@ class BumbleConnector:
             if self._status.get("stage") != "ERROR":
                 self._set_stage("STOPPED", "Bumble Agent 已停止")
 
-    def _first_action_contact(self, page):
+    def _process_contact(self, page, contact, contact_id: str, name: str, refresh_profile: bool, auto_send: bool) -> bool:
+        self._status.update({"last_contact_id": contact_id, "last_contact_name": name})
+        self._update_contact_status(contact_id, name=name, stage="CONTACT_FOUND")
+        self._set_stage("CONTACT_FOUND", "找到待回复联系人", data={"contact_id": contact_id, "name": name})
+        self._open_contact(contact)
+        time.sleep(0.8)
+        selected_uid = self._selected_contact_uid(page)
+        if selected_uid and bumble_contact_id(selected_uid) != contact_id:
+            self._update_contact_status(contact_id, stage="CONTACT_MISMATCH")
+            self._set_stage(
+                "CONTACT_MISMATCH",
+                "实际打开联系人和候选联系人不一致，已停止 Agent",
+                ok=False,
+                data={"expected_contact_id": contact_id, "actual_contact_id": bumble_contact_id(selected_uid)},
+            )
+            return False
+        self._update_contact_status(contact_id, stage="CONTACT_OPENED")
+        self._set_stage("CONTACT_OPENED", "已打开联系人会话", data={"contact_id": contact_id, "name": name})
+        self.service.memory.upsert_contact(contact_id=contact_id, display_name=name)
+        input_box = page.locator(INPUT_SELECTOR).first
+        self._fill_progress(input_box, "正在读取 profile 生成画像中，请等待……")
+        profile_updates = self._ensure_profile(page, contact_id, name, refresh_profile)
+        self._fill_progress(input_box, "正在分析对话中，请等待……")
+        pending_group = self._pending_incoming_group(page)
+        self._status["pending_group_count"] = len(pending_group)
+        self._update_contact_status(
+            contact_id,
+            message_count=self._status["message_count"],
+            last_out_index=self._status["last_out_index"],
+            pending_group_count=len(pending_group),
+            pending_group=[item.text for item in pending_group],
+        )
+        if not pending_group:
+            self._update_contact_status(contact_id, stage="NO_PENDING_GROUP")
+            self._set_stage(
+                "NO_PENDING_GROUP",
+                "没有待回复消息组",
+                data={
+                    "message_count": self._status["message_count"],
+                    "last_out_index": self._status["last_out_index"],
+                },
+            )
+            return True
+        self._set_stage(
+            "PENDING_GROUP_FOUND",
+            f"找到 {len(pending_group)} 条待回复 incoming",
+            data={"pending_group": [item.text for item in pending_group]},
+        )
+        self._update_contact_status(contact_id, stage="DRAFTING")
+        self._set_stage("DRAFTING", "开始逐条生成草稿", data={"pending_group_count": len(pending_group)})
+        reply_group = self._create_reply_group(contact_id, pending_group, input_box)
+        if not reply_group:
+            self._update_contact_status(contact_id, stage="NO_UNSENT_DRAFT")
+            self._set_stage("NO_UNSENT_DRAFT", "没有未发送草稿")
+            return True
+        self._update_contact_status(contact_id, stage="DRAFTED", last_reply_group=reply_group)
+        self._set_stage("DRAFTED", f"准备 {len(reply_group)} 条草稿")
+        self._status.update(
+            {
+                "last_contact_id": contact_id,
+                "last_contact_name": name,
+                "last_message": reply_group[-1]["incoming"],
+                "last_draft": reply_group[-1]["draft"],
+                "last_reply_group": reply_group,
+                "profile_updates": profile_updates,
+                "draft_count": int(self._status.get("draft_count", 0)) + len(reply_group),
+            }
+        )
+        sent = self._fill_or_send_reply_group(input_box, reply_group, auto_send, contact_id, page)
+        self._status["sent_count"] = int(self._status.get("sent_count", 0)) + sent
+        if sent:
+            self._update_contact_status(contact_id, stage="SENT_BY_ENTER", sent_count=sent)
+            self._set_stage("SENT_BY_ENTER", f"已按 Enter 发送 {sent} 条")
+            if auto_send and sent < len(reply_group):
+                self._update_contact_status(contact_id, stage="SEND_NOT_CONFIRMED", sent_count=sent)
+                self._set_stage(
+                    "SEND_NOT_CONFIRMED",
+                    "发送未确认，已停止 Agent，避免继续处理其他联系人",
+                    ok=False,
+                    data={"contact_id": contact_id, "sent_count": sent, "draft_count": len(reply_group)},
+                )
+                return False
+        else:
+            if auto_send:
+                self._update_contact_status(contact_id, stage="SEND_NOT_CONFIRMED", sent_count=0)
+                self._set_stage(
+                    "SEND_NOT_CONFIRMED",
+                    "发送未确认，已停止 Agent，避免继续处理其他联系人",
+                    ok=False,
+                    data={"contact_id": contact_id, "sent_count": 0, "draft_count": len(reply_group)},
+                )
+                return False
+            self._update_contact_status(contact_id, stage="FILLED_TEXTAREA", sent_count=0)
+            self._set_stage("FILLED_TEXTAREA", "自动发送关闭，只填入第一条草稿")
+        return True
+
+    def _action_contact_candidates(self, page) -> list[dict[str, Any]]:
         contacts = page.locator(ACTION_CONTACT_SELECTOR)
-        self._status["contact_count"] = contacts.count()
+        total_contacts = contacts.count()
         candidates = []
-        for index in range(contacts.count()):
+        for index in range(total_contacts):
             item = contacts.nth(index)
             try:
                 move_text = item.locator(".contact__move-label").inner_text(timeout=1000)
@@ -667,11 +729,27 @@ class BumbleConnector:
                     "move_text": move_text,
                 }
             )
-            if is_turn_label(move_text):
-                self._log("SCANNING_CONTACTS", "命中待回复联系人", data={"candidate": candidates[-1]})
-                return item
-        self._log("SCANNING_CONTACTS", "候选联系人未命中文本", data={"candidates": candidates[:20]})
-        return None
+        matches = [candidate for candidate in candidates if is_turn_label(candidate["move_text"])]
+        self._status["contact_count"] = len(matches)
+        if matches:
+            self._log(
+                "SCANNING_CONTACTS",
+                f"命中 {len(matches)} 个待回复联系人",
+                data={"total_contacts": total_contacts, "candidates": matches[:20]},
+            )
+            return matches
+        self._log(
+            "SCANNING_CONTACTS",
+            "候选联系人未命中文本",
+            data={"total_contacts": total_contacts, "candidates": candidates[:20]},
+        )
+        return []
+
+    def _first_action_contact(self, page):
+        candidates = self._action_contact_candidates(page)
+        if not candidates:
+            return None
+        return page.locator(ACTION_CONTACT_SELECTOR).nth(candidates[0]["index"])
 
     def _open_contact(self, contact) -> None:
         classes = contact.get_attribute("class") or ""
@@ -684,6 +762,15 @@ class BumbleConnector:
         except Exception as exc:
             self._log("CONTACT_FOUND", "普通点击失败，改用 JS click", ok=False, data={"error": str(exc)})
         contact.evaluate("element => element.click()")
+
+    def _selected_contact_uid(self, page) -> str:
+        try:
+            selected = page.locator(f"{CONTACT_SELECTOR}.is-selected").first
+            if selected.count() > 0:
+                return selected.get_attribute("data-qa-uid") or ""
+        except Exception:
+            return ""
+        return ""
 
     def _latest_incoming(self, page) -> str:
         messages = page.locator(INCOMING_MESSAGE_SELECTOR)
@@ -733,8 +820,28 @@ class BumbleConnector:
         reply_group = []
         for i, incoming in enumerate(pending_group):
             message_key = bumble_message_hash(contact_id, incoming.text)
-            if message_key in self._seen_messages:
+            if self._recently_sent(message_key):
                 self._status["skipped_duplicate_count"] = int(self._status.get("skipped_duplicate_count", 0)) + 1
+                self._set_stage(
+                    "SKIPPED_ALREADY_SENT",
+                    "消息已经发送过，跳过",
+                    data={"contact_id": contact_id, "incoming": incoming.text, "message_id": message_key},
+                )
+                continue
+            if message_key in self._sent_messages:
+                self._log(
+                    "DRAFTING",
+                    "历史发送标记仍在待回复组中，按未发送处理",
+                    data={"contact_id": contact_id, "incoming": incoming.text, "message_id": message_key},
+                )
+            draft = self._cached_or_recovered_draft(memory, message_key, contact_id, incoming.text)
+            if draft:
+                self._set_stage(
+                    "DRAFT_CACHED",
+                    "使用已缓存草稿",
+                    data={"contact_id": contact_id, "incoming": incoming.text, "draft": draft},
+                )
+                reply_group.append({"incoming": incoming.text, "draft": draft, "message_id": message_key})
                 continue
             self._fill_progress(input_box, f"正在生成第 {i + 1}/{total} 句回复，请等待……")
             try:
@@ -767,16 +874,36 @@ class BumbleConnector:
                 )
                 continue
             draft = payload["draft"]
+            self._draft_cache[message_key] = draft
+            if memory is not None and hasattr(memory, "cache_draft"):
+                memory.cache_draft(message_key, contact_id, incoming.text, draft)
             self._set_stage(
-                "DRAFTED",
-                f"第 {i + 1}/{total} 条草稿生成完成",
+                "DRAFT_CACHED",
+                f"第 {i + 1}/{total} 条草稿生成并缓存",
                 data={"contact_id": contact_id, "incoming": incoming.text, "draft": draft},
             )
-            self._seen_messages.add(message_key)
-            if memory is not None:
-                memory.mark_sent(message_key, contact_id)
             reply_group.append({"incoming": incoming.text, "draft": draft, "message_id": message_key})
         return reply_group
+
+    def _cached_or_recovered_draft(self, memory, message_key: str, contact_id: str, incoming: str) -> str:
+        if message_key in self._draft_cache:
+            return self._draft_cache[message_key]
+        if memory is None:
+            return ""
+        draft = memory.get_cached_draft(message_key) if hasattr(memory, "get_cached_draft") else ""
+        if draft:
+            self._draft_cache[message_key] = draft
+            return draft
+        draft = memory.recover_draft_for_message(message_key, contact_id) if hasattr(memory, "recover_draft_for_message") else ""
+        if draft and hasattr(memory, "cache_draft"):
+            memory.cache_draft(message_key, contact_id, incoming, draft)
+        if draft:
+            self._draft_cache[message_key] = draft
+        return draft
+
+    def _recently_sent(self, message_key: str) -> bool:
+        sent_at = self._sent_message_at.get(message_key, 0)
+        return message_key in self._sent_messages and time.time() - sent_at < 120
 
     def _reply_progress(self, input_box, index: int, total: int):
         def progress(stage: str) -> None:
@@ -790,19 +917,64 @@ class BumbleConnector:
 
         return progress
 
-    def _fill_or_send_reply_group(self, input_box, reply_group: list[dict[str, str]], auto_send: bool) -> int:
+    def _fill_or_send_reply_group(
+        self, input_box, reply_group: list[dict[str, str]], auto_send: bool, contact_id: str = "", page=None
+    ) -> int:
         if not reply_group:
             return 0
         if not auto_send:
             input_box.fill(reply_group[0]["draft"])
             return 0
         sent = 0
+        memory = getattr(self.service, "memory", None)
         for item in reply_group:
+            before_out_count = self._outgoing_count(page)
             input_box.fill(item["draft"])
             input_box.press("Enter")
+            if page is not None and not self._wait_for_outgoing(page, before_out_count, item["draft"]):
+                self._set_stage(
+                    "SEND_NOT_CONFIRMED",
+                    "按 Enter 后未确认新 outgoing，停止发送",
+                    ok=False,
+                    data={"contact_id": contact_id, "draft": item["draft"], "message_id": item.get("message_id", "")},
+                )
+                break
             sent += 1
+            message_key = item.get("message_id", "")
+            if message_key:
+                self._sent_messages.add(message_key)
+                self._sent_message_at[message_key] = time.time()
+                if memory is not None:
+                    memory.mark_sent(message_key, contact_id)
             time.sleep(0.4)
         return sent
+
+    def _outgoing_count(self, page) -> int:
+        if page is None:
+            return 0
+        try:
+            return page.locator(".messages-list__conversation .message.message--out").count()
+        except Exception:
+            return 0
+
+    def _latest_outgoing_text(self, page) -> str:
+        try:
+            outgoing = page.locator(".messages-list__conversation .message.message--out .message-bubble__text")
+            if outgoing.count() == 0:
+                return ""
+            return outgoing.nth(outgoing.count() - 1).inner_text(timeout=1000).strip()
+        except Exception:
+            return ""
+
+    def _wait_for_outgoing(self, page, before_out_count: int, draft: str, timeout_seconds: float = 8.0) -> bool:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if self._outgoing_count(page) > before_out_count:
+                latest = self._latest_outgoing_text(page)
+                if not latest or latest == draft or draft in latest:
+                    return True
+            time.sleep(0.25)
+        return False
 
     def _ensure_profile(self, page, contact_id: str, name: str, refresh: bool) -> list[dict[str, Any]]:
         self._update_contact_status(contact_id, profile_stage="PROFILE_CHECKING")

@@ -4,15 +4,38 @@ import tempfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from social_twin.service import DigitalTwinService, DraftRequest
 
 
 app = FastAPI(title="Social Strategy Digital Twin", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 service = DigitalTwinService()
 browser_agent = None
 bumble_agent = None
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
 
 
 class DraftIn(BaseModel):
@@ -73,6 +96,19 @@ def knowledge_report() -> dict:
     return service.report()
 
 
+@app.get("/contacts")
+def list_contacts() -> dict:
+    return {
+        "summary": service.memory.contact_overview(),
+        "contacts": service.memory.list_contacts(),
+    }
+
+
+@app.get("/contacts/{contact_id}")
+def contact_detail(contact_id: str) -> dict:
+    return service.memory.get_contact_detail(contact_id)
+
+
 @app.post("/draft")
 def create_draft(payload: DraftIn) -> dict:
     return service.create_draft(DraftRequest(**payload.dict()))
@@ -130,3 +166,8 @@ def bumble_agent_stop() -> dict:
 @app.get("/agent/bumble/status")
 def bumble_agent_status() -> dict:
     return bumble_agent.status()
+
+
+frontend_dist = Path(__file__).parent / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/", SPAStaticFiles(directory=frontend_dist, html=True), name="frontend")

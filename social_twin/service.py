@@ -207,6 +207,7 @@ class DigitalTwinService:
             channel=request.channel,
             role="draft",
             content=final_draft,
+            message_id=request.message_id,
             technique=technique,
             decision_reason=decision["reason"],
         )

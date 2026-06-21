@@ -23,12 +23,16 @@ class LanceVectorStore:
         if text not in self._encode_cache:
             if len(self._encode_cache) > 128:
                 self._encode_cache.clear()
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(self.embedder.encode, [text], convert_to_numpy=True)
-                try:
-                    result = future.result(timeout=30)
-                except FuturesTimeoutError:
-                    raise RuntimeError("embedding encode 超时（>30s）")
+            ex = ThreadPoolExecutor(max_workers=1)
+            future = ex.submit(self.embedder.encode, [text], convert_to_numpy=True)
+            try:
+                result = future.result(timeout=30)
+            except FuturesTimeoutError:
+                future.cancel()
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError("embedding encode 超时（>30s）")
+            else:
+                ex.shutdown(wait=True)
             self._encode_cache[text] = result[0].tolist()
         return self._encode_cache[text]
 
