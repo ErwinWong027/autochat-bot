@@ -1,311 +1,216 @@
-import json
-import re
-import os
-import time
-from datetime import datetime
-from dotenv import load_dotenv
-import lancedb
-import pyarrow as pa
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
+from __future__ import annotations
+
 import gradio as gr
 
-# 加载环境变量
-load_dotenv()
-API_KEY = os.getenv("DASHSCOPE_API_KEY")
-if not API_KEY:
-    raise ValueError("请在 .env 文件中设置 DASHSCOPE_API_KEY")
+from social_twin.bumble import BumbleConfig, BumbleConnector
+from social_twin.connectors import BrowserAgentConfig, BrowserAgentConnector
+from social_twin.service import DigitalTwinService, DraftRequest
 
-# 全局变量
-technique_theory = {}
-vector_store = None
-conversation_history = []  # 用于网页状态
-chat_log_file = "chat_history.json"
 
-# ======================
-# LanceDB 向量存储封装
-# ======================
-class LanceVectorStore:
-    def __init__(self, db_path: str = "./lancedb", table_name: str = "dialogue_cases"):
-        self.db_path = db_path
-        self.table_name = table_name
-        self.db = lancedb.connect(db_path)
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        self._ensure_table()
+service = DigitalTwinService()
+service.initialize()
+browser_agent = BrowserAgentConnector(service)
+bumble_agent = BumbleConnector(service)
 
-    def _ensure_table(self):
-        if self.table_name not in self.db.table_names():
-            schema = pa.schema([
-                pa.field("id", pa.string()),
-                pa.field("context", pa.string()),
-                pa.field("reply", pa.string()),
-                pa.field("technique", pa.string()),
-                pa.field("thinking", pa.string()),
-                pa.field("summary", pa.string()),
-                pa.field("vector", pa.list_(pa.float32(), 384))
-            ])
-            self.db.create_table(self.table_name, schema=schema, mode="create")
-        self.table = self.db.open_table(self.table_name)
 
-    def add(self, samples: list):
-        vectors = self.embedder.encode([s["context"] for s in samples], convert_to_numpy=True).tolist()
-        data = []
-        for i, s in enumerate(samples):
-            data.append({
-                "id": str(i),
-                "context": s["context"],
-                "reply": s["reply"],
-                "technique": s["technique"],
-                "thinking": s["thinking"],
-                "summary": s["summary"],
-                "vector": vectors[i]
-            })
-        self.table.add(data)
-
-    def query(self, query_text: str, technique: str = None, n_results: int = 2):
-        query_vec = self.embedder.encode([query_text], convert_to_numpy=True)[0].tolist()
-        search_builder = self.table.search(query_vec).limit(n_results)
-        
-        # 按 technique 过滤（LanceDB 支持 SQL-like filter）
-        if technique:
-            search_builder = search_builder.where(f"technique = '{technique}'", prefilter=True)
-        
-        results = search_builder.to_pandas()
-        if results.empty:
-            return {"ids": [[]], "metadatas": [[]]}
-        
-        # 转为 ChromaDB 兼容格式
-        metadatas = []
-        for _, row in results.iterrows():
-            metadatas.append({
-                "reply": row["reply"],
-                "technique": row["technique"],
-                "thinking": row["thinking"],
-                "summary": row["summary"]
-            })
-        return {
-            "ids": [results["id"].tolist()],
-            "metadatas": [metadatas]
-        }
-
-    def count(self):
-        return self.table.count_rows()
-
-# ======================
-# 初始化：加载 JSON + 构建向量库
-# ======================
-def initialize_system():
-    global technique_theory, vector_store
-    
-    print("🔄 正在加载知识库...")
-    with open("all_chapters.json", "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
-
-    # 提取 theory
-    technique_theory = {}
-    dialogue_samples = []
-
-    for chapter_key, cases in raw_data.items():
-        technique_match = re.search(r"[:：]\s*(.+)", chapter_key)
-        technique = technique_match.group(1).strip() if technique_match else "未知"
-        
-        for item in cases:
-            if "theory" in item:
-                technique_theory[technique] = item["theory"]
-                break
-        
-        for item in cases:
-            if "dialogue" not in item:
-                continue
-            dialogue = item["dialogue"]
-            history = []
-            for turn in dialogue:
-                if "reply" not in turn:
-                    continue
-                role = turn["role"]
-                content = turn["reply"]["content"]
-                if role == "B":
-                    history.append(f"B: {content}")
-                elif role == "A":
-                    if "thinking" in turn and "summary" in turn:
-                        context = " | ".join(history[-5:]) if history else "[开场]"
-                        dialogue_samples.append({
-                            "context": context,
-                            "reply": content,
-                            "technique": technique,
-                            "thinking": turn["thinking"],
-                            "summary": turn["summary"]
-                        })
-                    history.append(f"A: {content}")
-
-    # 初始化 LanceDB
-    vector_store = LanceVectorStore()
-
-    if vector_store.count() == 0:
-        print(f"🔍 发现新数据，正在索引 {len(dialogue_samples)} 个案例...")
-        vector_store.add(dialogue_samples)
-    
-    print(f"✅ 系统就绪！加载了 {len(technique_theory)} 种技术，{len(dialogue_samples)} 个案例。")
-    return True
-
-# ======================
-# 核心推理函数（保持不变）
-# ======================
-def decide_technique(current_context: str) -> dict:
-    theory_text = ""
-    for tech, th in technique_theory.items():
-        usage = "、".join(th.get("usage", []))
-        precautions = "；".join(th.get("precautions", []))
-        theory_text += f"【{tech}】\n- 用途：{usage}\n- 注意事项：{precautions}\n\n"
-    
-    prompt = f"""
-你是一个社交策略专家。当前对话上下文：
-「{current_context}」
-
-以下是可用沟通技术及其规则：
-{theory_text}
-
-请选出**最应使用的单一 technique**，并说明理由。
-输出严格为 JSON 格式：{{"selected_technique": "xxx", "reason": "xxx"}}
-"""
-    client = OpenAI(api_key=API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
-    resp = client.chat.completions.create(
-        model="qwen3-max",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=200
+def analyze_profile(contact_id: str, profile_text: str, image_path: str | None):
+    result = service.analyze_profile(
+        contact_id=contact_id.strip() or "default",
+        text=profile_text.strip(),
+        image_path=image_path or "",
     )
-    try:
-        return json.loads(resp.choices[0].message.content)
-    except:
-        return {"selected_technique": "询问", "reason": "默认回退"}
+    return result["profile"], result["updates"]
 
-def generate_reply(current_context: str, decision: dict) -> str:
-    tech = decision["selected_technique"]
-    th = technique_theory.get(tech, {})
-    
-    # 使用 LanceDB 查询（支持 where 过滤）
-    results = vector_store.query(
-        query_text=current_context,
-        technique=tech,
-        n_results=2
+
+def load_profile(contact_id: str):
+    return service.get_profile(contact_id.strip() or "default")
+
+
+def start_browser_agent(
+    target_url: str,
+    unread_selector: str,
+    message_selector: str,
+    input_selector: str,
+    send_selector: str,
+    contact_selector: str,
+):
+    return browser_agent.run(
+        BrowserAgentConfig(
+            target_url=target_url.strip(),
+            unread_selector=unread_selector.strip(),
+            message_selector=message_selector.strip(),
+            input_selector=input_selector.strip(),
+            send_selector=send_selector.strip(),
+            contact_selector=contact_selector.strip(),
+            poll_seconds=service.settings.browser_agent_poll_seconds,
+        )
     )
-    
-    cases_text = ""
-    for i in range(min(2, len(results["ids"][0]))):
-        rep = results["metadatas"][0][i]["reply"]
-        think = results["metadatas"][0][i]["thinking"]
-        summ = results["metadatas"][0][i]["summary"]
-        cases_text += f"回复：{rep}\n思考：{think}\n策略：{summ}\n\n"
-    
-    usage = "、".join(th.get("usage", []))
-    precautions = "；".join(th.get("precautions", []))
-    
-    prompt = f"""
-你正在使用「{tech}」技术。
-- 用途：{usage}
-- 注意事项：{precautions}
-不能连续多次使用同一个{tech}
-参考案例：
-{cases_text}
 
-当前上下文：「{current_context}」
-对话多用短句，每句不超过12字，末尾没有标点符号。生成一条自然、有效的回复。不能连续多次使用同一个{tech}。只输出回复内容。
-"""
-    client = OpenAI(api_key=API_KEY, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
-    resp = client.chat.completions.create(
-        model="qwen3-max",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-        max_tokens=100
+
+def stop_browser_agent():
+    return browser_agent.stop()
+
+
+def start_bumble_agent(target_url: str, auto_send_enabled: bool, refresh_profile: bool):
+    status = bumble_agent.run(
+        BumbleConfig(
+            target_url=target_url.strip() or service.settings.bumble_target_url,
+            auto_send_enabled=auto_send_enabled,
+            poll_seconds=service.settings.bumble_poll_seconds,
+            refresh_profile=refresh_profile,
+        )
     )
-    return resp.choices[0].message.content.strip()
-
-# ======================
-# 聊天与保存日志（保持不变）
-# ======================
-def save_chat_log(user_msg, bot_reply, decision):
-    log_entry = {
-        "timestamp": datetime.now().isoformat(),
-        "user_input": user_msg,
-        "bot_reply": bot_reply,
-        "technique_used": decision["selected_technique"],
-        "decision_reason": decision["reason"]
-    }
-    
-    if os.path.exists(chat_log_file):
-        with open(chat_log_file, "r", encoding="utf-8") as f:
-            logs = json.load(f)
-    else:
-        logs = []
-    
-    logs.append(log_entry)
-    
-    with open(chat_log_file, "w", encoding="utf-8") as f:
-        json.dump(logs, f, ensure_ascii=False, indent=2)
-
-def chat_with_bot(user_message, history):
-    global conversation_history
-    
-    # 更新全局历史（用于上下文）
-    conversation_history.append(f"B: {user_message}")
-    current_context = " | ".join(conversation_history[-5:])
-    
-    # 决策 + 生成回复
-    decision = decide_technique(current_context)
-    reply = generate_reply(current_context, decision)
-    
-    # 保存日志
-    save_chat_log(user_message, reply, decision)
-    
-    # 更新全局历史
-    conversation_history.append(f"A: {reply}")
-    
-    # ✅ 关键修复：使用新格式 [{"role": ..., "content": ...}, ...]
-    new_history = history + [
-        {"role": "user", "content": user_message},
-        {"role": "assistant", "content": reply}
-    ]
-    return new_history, ""
+    return _format_bumble_status(status)
 
 
-def reset_conversation():
-    global conversation_history
-    conversation_history = []
-    return [], ""  # 返回空列表，符合新格式
+def stop_bumble_agent():
+    return _format_bumble_status(bumble_agent.stop())
 
-# ======================
-# 启动 Gradio 界面（保持不变）
-# ======================
+
+def bumble_status():
+    return _format_bumble_status(bumble_agent.status())
+
+
+def _format_bumble_status(status: dict):
+    logs = status.get("logs", [])
+    log_text = "\n".join(
+        f"[{item.get('time')}] {item.get('stage')}({item.get('status_code')}) "
+        f"{'OK' if item.get('ok') else 'ERR'} - {item.get('message')} {item.get('data') or ''}"
+        for item in logs[-30:]
+    )
+    stage = f"{status.get('stage', '')} ({status.get('status_code', '')})"
+    return status, stage, status.get("last_error", ""), log_text
+
+
+def make_draft(
+    contact_id: str,
+    message: str,
+    channel: str,
+    contact_profile: str,
+    contact_identity: str,
+    relationship_stage: str,
+    taboos: str,
+    preferences: str,
+    recent_emotion: str,
+    interaction_frequency: str,
+):
+    result = service.create_draft(
+        DraftRequest(
+            contact_id=contact_id.strip() or "default",
+            message=message.strip(),
+            channel=channel.strip() or "manual",
+            contact_profile=contact_profile.strip(),
+            contact_identity=contact_identity.strip(),
+            relationship_stage=relationship_stage.strip(),
+            taboos=taboos.strip(),
+            preferences=preferences.strip(),
+            recent_emotion=recent_emotion.strip(),
+            interaction_frequency=interaction_frequency.strip(),
+        )
+    )
+    cases = "\n".join(f"- {case['technique']}：{case['reply']}" for case in result["retrieved_cases"])
+    detail = (
+        f"技术：{result['technique']}\n"
+        f"场景：{result['scenario']}\n"
+        f"理由：{result['decision_reason']}\n"
+        f"会话：{result['conversation_id']}\n"
+        f"风格问题：{','.join(result['style_issues']) or '无'}\n"
+        f"画像更新：{result['profile_updates']}\n"
+        f"模型：{result['models']}\n\n"
+        f"召回案例：\n{cases}"
+    )
+    return result["draft"], detail, ""
+
+
+with gr.Blocks(title="社交策略数字分身 v1") as demo:
+    gr.Markdown("## 社交策略数字分身 v1")
+    gr.Markdown("手动模式只生成草稿；Bumble Agent 在双开关允许时会按 Enter 自动发送。")
+    with gr.Row():
+        contact_id = gr.Textbox(label="联系人ID", value="default")
+        channel = gr.Textbox(label="渠道", value="manual")
+    with gr.Tab("画像分析"):
+        profile_image = gr.Image(label="社交主页截图", type="filepath")
+        profile_text = gr.Textbox(label="主页文字/补充信息", lines=6)
+        analyze_btn = gr.Button("分析并更新画像")
+        profile_json = gr.JSON(label="当前联系人画像")
+        profile_updates = gr.JSON(label="本次画像更新")
+        load_profile_btn = gr.Button("读取当前画像")
+        analyze_btn.click(
+            fn=analyze_profile,
+            inputs=[contact_id, profile_text, profile_image],
+            outputs=[profile_json, profile_updates],
+        )
+        load_profile_btn.click(fn=load_profile, inputs=[contact_id], outputs=[profile_json])
+    with gr.Tab("回复草稿"):
+        message = gr.Textbox(label="对方消息", lines=3)
+        with gr.Accordion("手动画像补充", open=False):
+            contact_profile = gr.Textbox(label="画像", lines=2)
+            contact_identity = gr.Textbox(label="身份")
+            relationship_stage = gr.Textbox(label="关系阶段")
+            recent_emotion = gr.Textbox(label="最近情绪")
+            interaction_frequency = gr.Textbox(label="互动频率")
+            taboos = gr.Textbox(label="禁忌")
+            preferences = gr.Textbox(label="偏好")
+        submit = gr.Button("生成草稿")
+        draft = gr.Textbox(label="回复草稿")
+        detail = gr.Textbox(label="策略详情", lines=12)
+        submit.click(
+            fn=make_draft,
+            inputs=[
+                contact_id,
+                message,
+                channel,
+                contact_profile,
+                contact_identity,
+                relationship_stage,
+                taboos,
+                preferences,
+                recent_emotion,
+                interaction_frequency,
+            ],
+            outputs=[draft, detail, message],
+        )
+    with gr.Tab("浏览器Agent"):
+        with gr.Tab("Bumble专用"):
+            gr.Markdown("读取 `轮到您了` 联系人，首次自动抓取画像，再生成草稿组。只有 `.env` 的 `AUTO_SEND_ENABLED=true` 且下方开关打开时，才会按 Enter 自动发送。")
+            bumble_url = gr.Textbox(label="Bumble URL", value=service.settings.bumble_target_url)
+            bumble_user_data_dir = gr.Textbox(label="登录态目录", value=service.settings.bumble_user_data_dir, interactive=False)
+            bumble_auto_send = gr.Checkbox(label="本次允许自动发送", value=service.settings.auto_send_enabled)
+            bumble_refresh_profile = gr.Checkbox(label="强制刷新画像", value=False)
+            with gr.Row():
+                start_bumble = gr.Button("启动 Bumble Agent")
+                stop_bumble = gr.Button("停止 Bumble Agent")
+                check_bumble = gr.Button("查看 Bumble 状态")
+            bumble_agent_status = gr.JSON(label="Bumble Agent状态")
+            bumble_stage = gr.Textbox(label="当前阶段")
+            bumble_error = gr.Textbox(label="最后错误")
+            bumble_logs = gr.Textbox(label="最近日志", lines=12)
+            start_bumble.click(
+                fn=start_bumble_agent,
+                inputs=[bumble_url, bumble_auto_send, bumble_refresh_profile],
+                outputs=[bumble_agent_status, bumble_stage, bumble_error, bumble_logs],
+            )
+            stop_bumble.click(fn=stop_bumble_agent, inputs=[], outputs=[bumble_agent_status, bumble_stage, bumble_error, bumble_logs])
+            check_bumble.click(fn=bumble_status, inputs=[], outputs=[bumble_agent_status, bumble_stage, bumble_error, bumble_logs])
+        with gr.Tab("通用选择器"):
+            gr.Markdown("保留通用网页 Agent，用于非 Bumble 网页。")
+            target_url = gr.Textbox(label="目标网页URL")
+            unread_selector = gr.Textbox(label="未读消息选择器")
+            message_selector = gr.Textbox(label="消息文本选择器")
+            input_selector = gr.Textbox(label="输入框选择器")
+            send_selector = gr.Textbox(label="发送按钮选择器")
+            contact_selector = gr.Textbox(label="联系人选择器")
+            with gr.Row():
+                start_agent = gr.Button("启动通用浏览器Agent")
+                stop_agent = gr.Button("停止通用浏览器Agent")
+            agent_status = gr.JSON(label="通用Agent状态")
+            start_agent.click(
+                fn=start_browser_agent,
+                inputs=[target_url, unread_selector, message_selector, input_selector, send_selector, contact_selector],
+                outputs=[agent_status],
+            )
+            stop_agent.click(fn=stop_browser_agent, inputs=[], outputs=[agent_status])
+
+
 if __name__ == "__main__":
-    initialize_system()
-    
-    with gr.Blocks(title="🧠 你的数字分身 - 社交策略版") as demo:
-        gr.Markdown("## 💬 和你的高拟真数字分身聊天")
-        gr.Markdown("它会根据你的沟通体系，动态选择「询问」「延词」「借势」等技术进行回复。")
-        
-        chatbot = gr.Chatbot(height=500)
-        msg = gr.Textbox(label="输入对方的消息", placeholder="例如：'最近好累啊...'")
-        with gr.Row():
-            submit_btn = gr.Button("发送")
-            clear_btn = gr.Button("清空对话")
-        
-        submit_btn.click(
-            fn=chat_with_bot,
-            inputs=[msg, chatbot],
-            outputs=[chatbot, msg]
-        )
-        msg.submit(
-            fn=chat_with_bot,
-            inputs=[msg, chatbot],
-            outputs=[chatbot, msg]
-        )
-        clear_btn.click(
-            fn=reset_conversation,
-            inputs=[],
-            outputs=[chatbot, msg]
-        )
-        
-        gr.Markdown(f"📝 所有对话将自动保存至 `{chat_log_file}`")
-    
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)

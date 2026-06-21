@@ -1,0 +1,11 @@
+fastapi
+gradio
+lancedb
+openai
+playwright
+python-multipart
+pydantic
+pyarrow
+python-dotenv
+sentence-transformers
+uvicorn

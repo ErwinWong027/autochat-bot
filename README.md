@@ -1,101 +1,218 @@
-# 数字孪生（社交策略版）
+# 社交策略数字分身 v1
 
-- 目标：构建一个“高拟真数字分身”，根据对话上下文自动选择沟通技术（如「询问」「延词」「借势」等），生成短句回复，并保存对话日志
-- 技术栈：LanceDB + sentence-transformers（向量检索）、DashScope（Qwen3 系列模型）、Gradio（可视化聊天界面）
-- 入口脚本：[digital_twin.py](file:///c:/Users/willi/OneDrive/桌面/digital_twin/digital_twin.py)
+结论：这是“本地建议器 + RAG 记忆库 + 草稿生成器”，只生成回复草稿，不自动发送。
 
-## 功能概述
-- 加载知识库：从 `all_chapters.json` 提取每种沟通技术的规则（用途、注意事项）与对话案例
-- 构建向量库：使用 `all-MiniLM-L6-v2` 将案例上下文嵌入，存入 LanceDB（本地目录 `./lancedb`）
-- 技术决策：综合最近 5 条上下文，调用 Qwen3 模型选择最合适的单一技术并给出理由
-- 回复生成：基于所选技术与检索到的相似案例，生成不超过 12 字的自然短句回复
-- 日志记录：把每次用户输入、系统回复、所用技术、选择理由写入 `chat_history.json`
-- Web 界面：Gradio 聊天窗，支持发送、清空操作，并自动保存日志
+## 功能
+- 读取 `all_chapters.json`，全量学习所有 A 端回复，生成知识覆盖报告，索引可追踪案例。
+- 使用 LanceDB 做案例检索，SQLite 区分联系人、渠道、会话和消息。
+- 使用 FastAPI 提供 `/draft` 草稿接口，Gradio 只作为本地调试界面。
+- 支持上传社交主页截图或粘贴主页文字，自动生成结构化联系人画像。
+- 每轮对话会自动抽取可用信息，补全联系人画像并保留证据。
+- 默认模型为 `qwen3.7-plus`，`qwen3.7-max` 只保留为高级备用配置。
+- 回复前做风格审查，压制长段落、AI 腔、讨好、乱开玩笑、比喻、连续问句。
 
-## 架构与数据流
-- 知识源：`all_chapters.json` 包含多个章节，每章内含：
-  - `theory`：技术规则（用途 usage、注意事项 precautions）
-  - `dialogue`：按轮次列出的对话，包含角色 `A`/`B`、以及 `reply.content`、`thinking`、`summary`
-- 数据处理：
-  - 读取 JSON → 提取「历史片段上下文」与「A 端回复」→ 嵌入向量 → 写入 LanceDB 表 `dialogue_cases`
-  - 运行时根据当前上下文 → 让大模型选择技术 → 在向量库中过滤该技术的案例并检索相似样本 → 生成最终回复
-- 关键模块：
-  - 向量库封装：类 LanceVectorStore（添加/查询/计数）参见 [digital_twin.py](file:///c:/Users/willi/OneDrive/桌面/digital_twin/digital_twin.py)
-  - 决策与生成：`decide_technique()`、`generate_reply()`，调用 DashScope 兼容的 `OpenAI` 客户端
-  - 前端：Gradio `Blocks` + `Chatbot`，监听文本框与按钮事件
-
-## 运行与配置
-- 环境变量：在 `.env` 写入 `DASHSCOPE_API_KEY=你的Key`
-- 安装依赖（建议虚拟环境）：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\activate
+## 运行
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -U pip
-python -m pip install python-dotenv lancedb pyarrow sentence-transformers openai gradio
+python -m pip install -r requirements.txt
 ```
 
-- 运行：
+`.env` 示例：
+```bash
+DASHSCOPE_API_KEY=你的Key
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DECISION_MODEL=qwen3.7-plus
+REPLY_MODEL=qwen3.7-plus
+CHEAP_MODEL=qwen3.6-flash
+PREMIUM_MODEL=qwen3.7-max
+PROFILE_VISION_MODEL=qwen3-vl-plus
+PROFILE_OCR_MODEL=qwen-vl-ocr-latest
+AUTO_SEND_ENABLED=false
+BROWSER_AGENT_TARGET_URL=
+BROWSER_AGENT_POLL_SECONDS=5
+BUMBLE_TARGET_URL=https://eu1.bumble.com/app/connections
+BUMBLE_POLL_SECONDS=5
+BUMBLE_USER_DATA_DIR=./browser_profiles/bumble
+```
 
-```powershell
+启动 FastAPI：
+```bash
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+启动 Gradio 调试界面：
+```bash
 python digital_twin.py
 ```
 
-- 默认行为：
-  - LanceDB 数据目录：`./lancedb`
-  - Web：`http://0.0.0.0:7860`，`share=True` 会生成公网临时链接
-  - 日志：`chat_history.json`
-
-## 数据文件说明（all_chapters.json）
-- 每个章节键名形如：`"第X章：询问"`，脚本会解析冒号后的技术名
-- 典型结构示例（精简）：
-
-```json
-{
-  "第1章：询问": [
-    {
-      "theory": {
-        "usage": ["获取更多信息", "引导对方表达"],
-        "precautions": ["避免质问语气", "保持同理心"]
-      }
-    },
-    {
-      "dialogue": [
-        {"role": "B", "reply": {"content": "最近好累啊"}},
-        {"role": "A", "reply": {"content": "怎么累的"}, "thinking": "...", "summary": "开放式提问"}
-      ]
-    }
-  ]
-}
+## API
+健康检查：
+```bash
+curl http://localhost:8000/health
 ```
 
-## 定制与扩展
-- 模型与提示词：
-  - `decide_technique()` 与 `generate_reply()` 中的提示可调整，用于控制风格与约束
-  - 如需个性化人设，可参考 `digital_twin4.py` 的生成提示，替换为你的信息
-- 技术库扩展：
-  - 在 `all_chapters.json` 添加新的章节与案例，脚本首次运行会自动索引到 LanceDB
-- 存储替换：
-  - 目前默认使用 LanceDB；如需迁移到 ChromaDB，需要改写向量存取逻辑
+知识覆盖报告：
+```bash
+curl http://localhost:8000/knowledge/report
+```
 
-## 项目结构
-- `digital_twin.py`：主应用（Gradio UI、决策与回复、日志）
-- `digital_twin4.py`：变体示例（更个性化的生成提示）
-- `all_chapters.json`：沟通技术与案例库
-- `chat_history.json`：对话日志
-- `lancedb/`：向量数据本地存储
-- `.gradio/`：Gradio 配置
-- `.env`：DashScope 密钥
-- `.py`：ChromaDB 最小化连通性测试脚本（如不需要可忽略）
+分析联系人主页：
+```bash
+curl -X POST http://localhost:8000/contacts/alice/profile/analyze \
+  -F 'profile_text=身高168cm，水瓶座，硕士，杭州，做金融，喜欢音乐旅行'
+```
 
-## 常见问题
-- DashScope 403 或鉴权失败：检查 `.env` 中 `DASHSCOPE_API_KEY` 是否正确，或网络是否能访问 `https://dashscope.aliyuncs.com`
-- 首次运行空向量库：会自动索引 `all_chapters.json` 的案例，时间取决于数据量
-- 中文分词与短句：生成阶段已加入“每句不超过 12 字”的约束，可在提示词中调整
+读取联系人画像：
+```bash
+curl http://localhost:8000/contacts/alice/profile
+```
 
-## Git 使用快捷指令
-- 初始化后首次提交：
-```powershell
-git add .
-git commit -m "初始化项目与 README 与数据结构说明"
+生成草稿：
+```bash
+curl -X POST http://localhost:8000/draft \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contact_id": "alice",
+    "channel": "manual",
+    "message": "最近真的好累",
+    "contact_identity": "朋友",
+    "contact_profile": "朋友，工作压力大",
+    "relationship_stage": "熟悉",
+    "recent_emotion": "疲惫",
+    "interaction_frequency": "每周几次",
+    "preferences": "喜欢短句，不喜欢说教"
+  }'
+```
+
+返回包含：
+- `draft`：只生成草稿，不发送
+- `technique`：本轮使用的沟通技术
+- `scenario`：场景识别
+- `retrieved_cases`：召回案例
+- `conversation_id`：独立会话 ID
+- `style_issues`：风格审查结果
+- `profile_updates`：本轮对话自动补全/更新的画像信息
+
+## Bumble Agent 使用
+结论：Bumble Agent 默认只生成草稿并填入输入框，不发送。
+
+首次运行前安装浏览器驱动：
+```bash
+python -m playwright install chromium
+```
+
+启动服务后运行 Bumble Agent：
+```bash
+curl -X POST http://127.0.0.1:8000/agent/bumble/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_url": "https://eu1.bumble.com/app/connections",
+    "auto_send_enabled": false,
+    "poll_seconds": 5
+  }'
+```
+
+查看状态：
+```bash
+curl http://127.0.0.1:8000/agent/bumble/status
+```
+
+停止 Agent：
+```bash
+curl -X POST http://127.0.0.1:8000/agent/bumble/stop
+```
+
+运行过程会在 Bumble 输入框显示阶段提示：
+- `正在读取 profile 生成画像中，请等待……`
+- `正在分析对话中，请等待……`
+- `正在数据检索 RAG 中，请等待……`
+- `正在生成第 1/3 句回复，请等待……`
+- 生成完成后用草稿替代提示文字。
+
+自动发送需要同时满足两个条件：
+- `.env` 中 `AUTO_SEND_ENABLED=true`
+- 启动 Agent 时 `auto_send_enabled=true`
+
+## 工作原理
+结论：系统是“结构化画像 + 会话记忆 + RAG 案例 + 风格审查”的草稿生成链路。
+
+流程：
+1. 读取联系人、消息和 profile DOM。
+2. 用 SQLite 保存联系人、会话、消息、画像字段和证据。
+3. 从 `all_chapters.json` 和 `persona_dialogues/*.json` 建立 LanceDB 案例索引。
+4. 每轮先识别场景和关系状态，再选择沟通技术。
+5. 用 RAG 召回策略案例、自然对话案例和人物关系案例。
+6. 调用模型生成短句草稿。
+7. 做风格审查，必要时重写或回退到自然样本。
+
+性能机制：
+- RAG 本地检索通常不是主要慢点，主要耗时来自远端 LLM 调用。
+- 当前 Bumble 对待回复消息逐条生成，质量稳定但慢。
+- 更快方案是同一 pending group 只做一次分析、一次 RAG、一次模型生成，直接返回多句草稿。
+- `sent_messages` 只记录成功生成过的消息，失败不会被误标记为已处理。
+
+## 数据入口
+`all_chapters.json` 负责策略库。所有 A 端回复都会入库：
+- `annotated_strategy`：带 `thinking` 和 `summary`，用于学习策略解释。
+- `natural_dialogue`：没有 `thinking/summary`，用于学习真人语气、节奏和上下文接法。
+
+当前覆盖目标：
+- `total_a_replies = 178`
+- `annotated_strategy = 53`
+- `natural_dialogue = 125`
+- `vector_rows = 178`
+
+额外人物/关系对话放到 `persona_dialogues/*.json`，格式：
+```json
+[
+  {
+    "identity": "朋友",
+    "relation": "熟悉",
+    "scene": "工作压力",
+    "their_message": "最近真的好累",
+    "my_reply": "先缓一口气",
+    "effect": "承接情绪",
+    "tags": ["情绪", "安抚"]
+  }
+]
+```
+
+## 架构
+- `app.py`：FastAPI 服务入口
+- `digital_twin.py`：Gradio 调试入口
+- `social_twin/knowledge.py`：知识摄取与覆盖报告
+- `social_twin/vector_store.py`：LanceDB 检索
+- `social_twin/memory.py`：SQLite 多联系人会话记忆
+- `social_twin/service.py`：场景识别、策略选择、案例检索、草稿生成
+- `social_twin/style.py`：去 AI 味风格审查
+- `social_twin/connectors.py`：手动、API、浏览器 Agent 接入边界；v1 只返回草稿，需要人工确认
+- `social_twin/profile.py`：主页截图/文字画像分析与对话画像更新
+
+## 浏览器 Agent
+第一版支持网页自动化边界：打开网页、查找未读消息、生成草稿、填入输入框、点击发送。
+
+全自动发送受 `.env` 中 `AUTO_SEND_ENABLED` 控制。启用前需要安装浏览器驱动：
+
+```bash
+python -m playwright install chromium
+```
+
+桌面 App 和手机自动化暂不实现。
+
+## 最近更新
+- 新增 FastAPI 服务入口和 Bumble 专用 Agent。
+- 新增联系人画像分析、画像证据库和对话画像自动更新。
+- 新增 `sent_messages` 去重，避免同一 incoming 重复生成。
+- Bumble Agent 支持按联系人独立状态、读取 profile、识别待回复消息组、填入草稿。
+- Bumble Agent 输入框会显示真实阶段提示：profile、分析、RAG、逐句生成。
+- 修复 `SentenceTransformer.encode` 参数兼容问题，避免 `Prompt name 'True'`。
+- 草稿生成失败不再写入已处理消息，失败消息可重试。
+- 测试替身不再强依赖真实 SQLite memory，单元测试可隔离 Bumble 状态逻辑。
+
+## 验证
+```bash
+python3 -m py_compile app.py digital_twin.py digital_twin4.py social_twin/*.py
+python3 -m unittest
 ```

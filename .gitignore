@@ -8,6 +8,10 @@ __pycache__/
 # 数据与生成目录
 lancedb/
 .gradio/
+browser_profiles/
+*.db
+*.sqlite
+*.sqlite3
 
 # IDE 与日志
 .idea/
