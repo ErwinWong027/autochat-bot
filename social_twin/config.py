@@ -26,6 +26,9 @@ class Settings:
     lance_table: str
     sqlite_path: str
     embed_model: str
+    android_adb_address: str
+    android_poll_seconds: int
+    android_auto_send_enabled: bool
     server_host: str
     server_port: int
 
@@ -56,6 +59,9 @@ def load_settings() -> Settings:
         lance_table=os.getenv("LANCE_TABLE", "dialogue_cases_v2"),
         sqlite_path=os.getenv("SQLITE_PATH", "social_twin.db"),
         embed_model=os.getenv("EMBED_MODEL", "all-MiniLM-L6-v2"),
+        android_adb_address=os.getenv("ANDROID_ADB_ADDRESS", ""),
+        android_poll_seconds=int(os.getenv("ANDROID_POLL_SECONDS", "8")),
+        android_auto_send_enabled=os.getenv("ANDROID_AUTO_SEND_ENABLED", "true").lower() == "true",
         server_host=os.getenv("SERVER_HOST", "0.0.0.0"),
         server_port=int(os.getenv("SERVER_PORT", "8000")),
     )

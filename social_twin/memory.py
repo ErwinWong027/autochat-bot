@@ -228,7 +228,7 @@ class MemoryStore:
             rows = conn.execute(
                 """
                 select technique from messages
-                where conversation_id = ? and role in ('assistant', 'draft') and technique is not null and technique != ''
+                where conversation_id = ? and role in ('assistant', 'draft', 'sent') and technique is not null and technique != ''
                 order by id desc limit ?
                 """,
                 (conversation_id, limit),
@@ -308,6 +308,11 @@ class MemoryStore:
                 "insert or ignore into sent_messages (hash, contact_id, created_at) values (?, ?, ?)",
                 (hash, contact_id, now),
             )
+            # 把对应的 draft 消息记录升级为 sent
+            conn.execute(
+                "update messages set role='sent' where message_id=? and contact_id=? and role='draft'",
+                (hash, contact_id),
+            )
 
     def cache_draft(self, message_hash: str, contact_id: str, incoming: str, draft: str) -> None:
         now = datetime.now().isoformat()
@@ -369,7 +374,7 @@ class MemoryStore:
                 select
                     count(distinct contact_id) as contact_count,
                     count(*) as message_count,
-                    sum(case when role in ('assistant', 'draft') then 1 else 0 end) as reply_count
+                    sum(case when role in ('assistant', 'draft', 'sent') then 1 else 0 end) as reply_count
                 from messages
                 """
             ).fetchone()
@@ -405,7 +410,7 @@ class MemoryStore:
                         m.contact_id,
                         max(m.channel) as channel,
                         count(*) as message_count,
-                        sum(case when m.role in ('assistant', 'draft') then 1 else 0 end) as reply_count,
+                        sum(case when m.role in ('assistant', 'draft', 'sent') then 1 else 0 end) as reply_count,
                         (
                             select content from messages lm
                             where lm.contact_id = m.contact_id

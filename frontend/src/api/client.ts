@@ -153,3 +153,50 @@ export function stopBumble() {
     method: "POST"
   });
 }
+
+export type AndroidStatus = {
+  running: boolean;
+  stage: string;
+  status_code: number;
+  app: string;
+  last_error?: string;
+  last_contact_id?: string;
+  last_contact_name?: string;
+  last_draft?: string;
+  sent_count?: number;
+  draft_count?: number;
+  contact_count?: number;
+  pending_group_count?: number;
+  skipped_duplicate_count?: number;
+  logs?: Array<{
+    time: string;
+    stage: string;
+    status_code: number;
+    ok: boolean;
+    message: string;
+    data?: Record<string, unknown>;
+  }>;
+};
+
+export type AndroidRunPayload = {
+  adb_address: string;
+  auto_send_enabled: boolean | null;
+  poll_seconds: number;
+};
+
+export function getAndroidStatus(app: string) {
+  return request<AndroidStatus>(`/agent/android/${encodeURIComponent(app)}/status`);
+}
+
+export function startAndroid(app: string, payload: AndroidRunPayload) {
+  return request<AndroidStatus>(`/agent/android/${encodeURIComponent(app)}/run`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export function stopAndroid(app: string) {
+  return request<AndroidStatus>(`/agent/android/${encodeURIComponent(app)}/stop`, {
+    method: "POST"
+  });
+}

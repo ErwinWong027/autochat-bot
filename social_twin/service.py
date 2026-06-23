@@ -191,7 +191,7 @@ class DigitalTwinService:
             recent=recent,
             structured_profile=structured_profile,
         )
-        assistant_recent = [item["content"] for item in recent if item["role"] in ("assistant", "draft")]
+        assistant_recent = [item["content"] for item in recent if item["role"] in ("assistant", "draft", "sent")]
         style = inspect_style(draft, assistant_recent)
         if style.needs_rewrite:
             draft = self._rewrite_reply(style.text or draft, style.issues, context)
@@ -271,7 +271,7 @@ class DigitalTwinService:
         }
 
     def _format_context(self, messages: list[dict[str, Any]]) -> str:
-        role_map = {"user": "B", "assistant": "A", "draft": "A草稿"}
+        role_map = {"user": "B", "assistant": "A", "draft": "A草稿", "sent": "A已发"}
         return " | ".join(f"{role_map.get(item['role'], item['role'])}: {item['content']}" for item in messages[-8:])
 
     def _detect_scenario(self, message: str, context: str) -> str:
@@ -363,7 +363,7 @@ class DigitalTwinService:
             f"- 对方：{case['context_3']}\n  过往回复：{case['reply']}\n  风格：{case['reply_style']}"
             for case in persona_cases[:3]
         )
-        recent_reply_text = " / ".join(item["content"] for item in recent if item["role"] in ("assistant", "draft"))
+        recent_reply_text = " / ".join(item["content"] for item in recent if item["role"] in ("assistant", "draft", "sent"))
         profile_fields = structured_profile.get("fields", {})
         structured_profile_text = "\n".join(
             f"- {field}: {value['value']} 置信度{value['confidence']}"

@@ -620,9 +620,8 @@ class BumbleConnector:
         self._update_contact_status(contact_id, name=name, stage="CONTACT_FOUND")
         self._set_stage("CONTACT_FOUND", "找到待回复联系人", data={"contact_id": contact_id, "name": name})
         self._open_contact(contact)
-        time.sleep(0.8)
-        selected_uid = self._selected_contact_uid(page)
-        if selected_uid and bumble_contact_id(selected_uid) != contact_id:
+        selected_uid = self._wait_for_selected_contact_uid(page, contact_id)
+        if not selected_uid or bumble_contact_id(selected_uid) != contact_id:
             self._update_contact_status(contact_id, stage="CONTACT_MISMATCH")
             self._set_stage(
                 "CONTACT_MISMATCH",
@@ -771,6 +770,16 @@ class BumbleConnector:
         except Exception:
             return ""
         return ""
+
+    def _wait_for_selected_contact_uid(self, page, expected_contact_id: str, timeout_seconds: float = 3.0) -> str:
+        deadline = time.time() + timeout_seconds
+        selected_uid = ""
+        while time.time() < deadline:
+            selected_uid = self._selected_contact_uid(page)
+            if selected_uid and bumble_contact_id(selected_uid) == expected_contact_id:
+                return selected_uid
+            time.sleep(0.2)
+        return selected_uid
 
     def _latest_incoming(self, page) -> str:
         messages = page.locator(INCOMING_MESSAGE_SELECTOR)

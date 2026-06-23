@@ -428,6 +428,20 @@ button.ghost {
   padding-right: 8px;
 }
 
+.contact-search {
+  width: 100%;
+  padding: 10px 14px;
+  border: 2px solid var(--ink);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 0.9rem;
+  border-radius: 0;
+  outline: none;
+}
+.contact-search:focus {
+  border-color: var(--red);
+}
+
 .contact-card {
   width: 100%;
   padding: 18px;

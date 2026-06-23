@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import List, Optional
 
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -26,6 +27,7 @@ app.add_middleware(
 service = DigitalTwinService()
 browser_agent = None
 bumble_agent = None
+android_agents: dict = {}
 
 
 class SPAStaticFiles(StaticFiles):
@@ -42,7 +44,7 @@ class DraftIn(BaseModel):
     contact_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1)
     channel: str = "manual"
-    conversation_id: str | None = None
+    conversation_id: Optional[str] = None
     message_id: str = ""
     contact_profile: str = ""
     contact_identity: str = ""
@@ -54,7 +56,7 @@ class DraftIn(BaseModel):
 
 
 class ProfileUpdateIn(BaseModel):
-    updates: list[dict]
+    updates: List[dict]
 
 
 class BrowserAgentRunIn(BaseModel):
@@ -64,26 +66,34 @@ class BrowserAgentRunIn(BaseModel):
     input_selector: str = ""
     send_selector: str = ""
     contact_selector: str = ""
-    auto_send_enabled: bool | None = None
+    auto_send_enabled: Optional[bool] = None
     poll_seconds: int = 5
 
 
 class BumbleRunIn(BaseModel):
     target_url: str = ""
-    auto_send_enabled: bool | None = None
+    auto_send_enabled: Optional[bool] = None
     poll_seconds: int = 5
     refresh_profile: bool = False
 
 
+class AndroidRunIn(BaseModel):
+    adb_address: str = ""
+    auto_send_enabled: Optional[bool] = None
+    poll_seconds: int = 0
+
+
 @app.on_event("startup")
 def startup() -> None:
-    global browser_agent, bumble_agent
+    global browser_agent, bumble_agent, android_agents
+    from social_twin.android_apps import REGISTRY
     from social_twin.bumble import BumbleConnector
     from social_twin.connectors import BrowserAgentConnector
 
     service.initialize()
     browser_agent = BrowserAgentConnector(service)
     bumble_agent = BumbleConnector(service)
+    android_agents = {app_key: cls(service) for app_key, cls in REGISTRY.items()}
 
 
 @app.get("/health")
@@ -118,7 +128,7 @@ def create_draft(payload: DraftIn) -> dict:
 async def analyze_profile(
     contact_id: str,
     profile_text: str = Form(""),
-    image: UploadFile | None = File(None),
+    image: Optional[UploadFile] = File(None),
 ) -> dict:
     image_path = ""
     if image and image.filename:
@@ -166,6 +176,29 @@ def bumble_agent_stop() -> dict:
 @app.get("/agent/bumble/status")
 def bumble_agent_status() -> dict:
     return bumble_agent.status()
+
+
+@app.post("/agent/android/{app}/run")
+def android_agent_run(app: str, payload: AndroidRunIn) -> dict:
+    if app not in android_agents:
+        raise HTTPException(status_code=404, detail=f"未知 app: {app}，支持: {list(android_agents)}")
+    from social_twin.android_base import AndroidConfig
+
+    return android_agents[app].run(AndroidConfig(**payload.dict()))
+
+
+@app.post("/agent/android/{app}/stop")
+def android_agent_stop(app: str) -> dict:
+    if app not in android_agents:
+        raise HTTPException(status_code=404, detail=f"未知 app: {app}")
+    return android_agents[app].stop()
+
+
+@app.get("/agent/android/{app}/status")
+def android_agent_status(app: str) -> dict:
+    if app not in android_agents:
+        raise HTTPException(status_code=404, detail=f"未知 app: {app}")
+    return android_agents[app].status()
 
 
 frontend_dist = Path(__file__).parent / "frontend" / "dist"

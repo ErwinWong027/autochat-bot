@@ -1,20 +1,34 @@
 import { useEffect, useMemo, useState } from "react";
 import heroCharacter from "./assets/hero-character.png";
 import {
+  AndroidRunPayload,
+  AndroidStatus,
   BumbleStatus,
   ContactDetail,
   ContactSummary,
   DraftResult,
   createDraft,
+  getAndroidStatus,
   getBumbleStatus,
   getContact,
   getContacts,
+  startAndroid,
   startBumble,
+  stopAndroid,
   stopBumble,
   type Overview
 } from "./api/client";
 
 type Route = "/about" | "/agent" | "/board";
+
+const ANDROID_APPS_CONFIG = [
+  { key: "wechat", label: "微信" },
+  { key: "tantan", label: "探探" },
+  { key: "momo", label: "陌陌" },
+  { key: "red", label: "小红书" },
+  { key: "qianshou", label: "千手" },
+] as const;
+type AndroidAppKey = typeof ANDROID_APPS_CONFIG[number]["key"];
 
 const defaultOverview: Overview = {
   contact_count: 0,
@@ -114,6 +128,13 @@ export default function App() {
   const [draftInput, setDraftInput] = useState("");
   const [draftResult, setDraftResult] = useState<DraftResult | null>(null);
   const [error, setError] = useState("");
+  const [selectedAndroidApp, setSelectedAndroidApp] = useState<AndroidAppKey>("tantan");
+  const [androidAdbAddress, setAndroidAdbAddress] = useState("127.0.0.1:7555");
+  const [androidAutoSend, setAndroidAutoSend] = useState(true);
+  const [androidPollSeconds, setAndroidPollSeconds] = useState(8);
+  const [androidStatuses, setAndroidStatuses] = useState<Record<AndroidAppKey, AndroidStatus | null>>(
+    Object.fromEntries(ANDROID_APPS_CONFIG.map((a) => [a.key, null])) as Record<AndroidAppKey, AndroidStatus | null>
+  );
 
   function navigate(nextRoute: Route) {
     window.history.pushState(null, "", nextRoute);
@@ -137,6 +158,37 @@ export default function App() {
     }
   }
 
+  async function refreshAndroidStatuses() {
+    const next = { ...androidStatuses };
+    await Promise.allSettled(
+      ANDROID_APPS_CONFIG.map(async ({ key }) => {
+        try {
+          next[key] = await getAndroidStatus(key);
+        } catch {
+          next[key] = null;
+        }
+      })
+    );
+    setAndroidStatuses({ ...next });
+  }
+
+  async function handleStartAndroid() {
+    setError("");
+    const payload: AndroidRunPayload = {
+      adb_address: androidAdbAddress,
+      auto_send_enabled: androidAutoSend,
+      poll_seconds: androidPollSeconds,
+    };
+    const result = await startAndroid(selectedAndroidApp, payload);
+    setAndroidStatuses((prev) => ({ ...prev, [selectedAndroidApp]: result }));
+  }
+
+  async function handleStopAndroid() {
+    setError("");
+    const result = await stopAndroid(selectedAndroidApp);
+    setAndroidStatuses((prev) => ({ ...prev, [selectedAndroidApp]: result }));
+  }
+
   useEffect(() => {
     const onPopState = () => setRoute(currentRoute());
     window.addEventListener("popstate", onPopState);
@@ -146,11 +198,13 @@ export default function App() {
   useEffect(() => {
     refreshContacts().catch((err) => setError(err.message));
     refreshStatus();
+    refreshAndroidStatuses();
   }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
       refreshStatus();
+      refreshAndroidStatuses();
       if (route === "/board") refreshContacts(selectedId).catch(() => undefined);
     }, 5000);
     return () => window.clearInterval(timer);
@@ -206,7 +260,7 @@ export default function App() {
     <main>
       <nav className="top-nav" aria-label="Primary navigation">
         <button className={route === "/about" ? "nav-active" : ""} onClick={() => navigate("/about")}>ABOUT</button>
-        <button className={route === "/agent" ? "nav-active" : ""} onClick={() => navigate("/agent")}>浏览器Agent</button>
+        <button className={route === "/agent" ? "nav-active" : ""} onClick={() => navigate("/agent")}>Agent控制台</button>
         <button className={route === "/board" ? "nav-active" : ""} onClick={() => navigate("/board")}>联系人看板</button>
       </nav>
 
@@ -224,6 +278,17 @@ export default function App() {
           setPollSeconds={setPollSeconds}
           handleStartBumble={() => handleStartBumble().catch((err) => setError(err.message))}
           handleStopBumble={() => handleStopBumble().catch((err) => setError(err.message))}
+          androidStatuses={androidStatuses}
+          selectedAndroidApp={selectedAndroidApp}
+          androidAdbAddress={androidAdbAddress}
+          androidAutoSend={androidAutoSend}
+          androidPollSeconds={androidPollSeconds}
+          setSelectedAndroidApp={setSelectedAndroidApp}
+          setAndroidAdbAddress={setAndroidAdbAddress}
+          setAndroidAutoSend={setAndroidAutoSend}
+          setAndroidPollSeconds={setAndroidPollSeconds}
+          handleStartAndroid={() => handleStartAndroid().catch((err) => setError(err.message))}
+          handleStopAndroid={() => handleStopAndroid().catch((err) => setError(err.message))}
         />
       )}
       {route === "/board" && (
@@ -280,6 +345,41 @@ function AboutPage() {
   );
 }
 
+function StatusPanel({ status }: { status: BumbleStatus | AndroidStatus | null }) {
+  return (
+    <div className="status-panel">
+      <div className="status-head">
+        <span className={status?.running ? "live-dot on" : "live-dot"} />
+        <strong>{status?.stage || "OFFLINE"}</strong>
+        <span>#{status?.status_code ?? "000"}</span>
+      </div>
+      <div className="metrics">
+        <div><b>{status?.contact_count ?? 0}</b><span>待回复联系人</span></div>
+        <div><b>{status?.draft_count ?? 0}</b><span>草稿</span></div>
+        <div><b>{status?.sent_count ?? 0}</b><span>发送</span></div>
+        <div><b>{status?.pending_group_count ?? 0}</b><span>待处理消息</span></div>
+      </div>
+      <p className="last-line">
+        {(status as BumbleStatus | null)?.last_error ||
+          (status as AndroidStatus | null)?.last_error ||
+          (status as BumbleStatus | null)?.last_draft ||
+          (status as AndroidStatus | null)?.last_draft ||
+          "等待 Agent 状态。"}
+      </p>
+      <div className="log-list">
+        {(status?.logs || []).slice(-8).reverse().map((log) => (
+          <div className="log-line" key={`${log.time}-${log.stage}-${log.message}`}>
+            <span>{log.time}</span>
+            <b>{log.stage}</b>
+            <em>{log.ok ? "OK" : "ERR"}</em>
+            <p>{log.message}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AgentPage(props: {
   status: BumbleStatus | null;
   targetUrl: string;
@@ -292,7 +392,19 @@ function AgentPage(props: {
   setPollSeconds: (value: number) => void;
   handleStartBumble: () => void;
   handleStopBumble: () => void;
+  androidStatuses: Record<AndroidAppKey, AndroidStatus | null>;
+  selectedAndroidApp: AndroidAppKey;
+  androidAdbAddress: string;
+  androidAutoSend: boolean;
+  androidPollSeconds: number;
+  setSelectedAndroidApp: (value: AndroidAppKey) => void;
+  setAndroidAdbAddress: (value: string) => void;
+  setAndroidAutoSend: (value: boolean) => void;
+  setAndroidPollSeconds: (value: number) => void;
+  handleStartAndroid: () => void;
+  handleStopAndroid: () => void;
 }) {
+  const androidStatus = props.androidStatuses[props.selectedAndroidApp];
   return (
     <section className="page agent-page">
       <div className="section-label">BROWSER AGENT / BUMBLE</div>
@@ -322,31 +434,50 @@ function AgentPage(props: {
             <button className="ghost" onClick={props.handleStopBumble}>STOP</button>
           </div>
         </div>
+        <StatusPanel status={props.status} />
+      </div>
 
-        <div className="status-panel">
-          <div className="status-head">
-            <span className={props.status?.running ? "live-dot on" : "live-dot"} />
-            <strong>{props.status?.stage || "OFFLINE"}</strong>
-            <span>#{props.status?.status_code ?? "000"}</span>
-          </div>
-          <div className="metrics">
-            <div><b>{props.status?.contact_count ?? 0}</b><span>待回复联系人</span></div>
-            <div><b>{props.status?.draft_count ?? 0}</b><span>草稿</span></div>
-            <div><b>{props.status?.sent_count ?? 0}</b><span>发送</span></div>
-            <div><b>{props.status?.pending_group_count ?? 0}</b><span>待处理消息</span></div>
-          </div>
-          <p className="last-line">{props.status?.last_error || props.status?.last_draft || "等待 Agent 状态。"}</p>
-          <div className="log-list">
-            {(props.status?.logs || []).slice(-8).reverse().map((log) => (
-              <div className="log-line" key={`${log.time}-${log.stage}-${log.message}`}>
-                <span>{log.time}</span>
-                <b>{log.stage}</b>
-                <em>{log.ok ? "OK" : "ERR"}</em>
-                <p>{log.message}</p>
-              </div>
+      <div className="section-label" style={{ marginTop: "2rem" }}>ANDROID AGENT / 手机 APP</div>
+      <div className="agent-layout">
+        <div className="agent-panel">
+          <h2>Android 模拟器自动回复</h2>
+          <div className="control-row" style={{ flexWrap: "wrap", gap: "0.4rem" }}>
+            {ANDROID_APPS_CONFIG.map(({ key, label }) => (
+              <button
+                key={key}
+                className={props.selectedAndroidApp === key ? "" : "ghost"}
+                style={{ padding: "0.3rem 0.8rem", fontSize: "0.85rem" }}
+                onClick={() => props.setSelectedAndroidApp(key)}
+              >
+                {label}
+                {props.androidStatuses[key]?.running && <span style={{ marginLeft: "0.3rem", color: "#4caf50" }}>●</span>}
+              </button>
             ))}
           </div>
+          <label>
+            ADB 地址（模拟器端口）
+            <input
+              value={props.androidAdbAddress}
+              onChange={(event) => props.setAndroidAdbAddress(event.target.value)}
+              placeholder="127.0.0.1:7555"
+            />
+          </label>
+          <div className="control-row">
+            <label className="checkbox-label">
+              <input type="checkbox" checked={props.androidAutoSend} onChange={(event) => props.setAndroidAutoSend(event.target.checked)} />
+              自动发送
+            </label>
+          </div>
+          <label>
+            轮询秒数
+            <input type="number" min={3} value={props.androidPollSeconds} onChange={(event) => props.setAndroidPollSeconds(Number(event.target.value))} />
+          </label>
+          <div className="button-row">
+            <button onClick={props.handleStartAndroid}>START</button>
+            <button className="ghost" onClick={props.handleStopAndroid}>STOP</button>
+          </div>
         </div>
+        <StatusPanel status={androidStatus} />
       </div>
     </section>
   );
@@ -365,6 +496,13 @@ function BoardPage(props: {
   refresh: () => void;
   handleDraft: () => void;
 }) {
+  const [searchQuery, setSearchQuery] = useState("");
+  const filteredContacts = searchQuery.trim()
+    ? props.contacts.filter((c) =>
+        (c.display_name || c.contact_id || "").toLowerCase().includes(searchQuery.toLowerCase())
+      )
+    : props.contacts;
+
   return (
     <section className="page board-page">
       <div className="section-label">CONTACT BOARD / MEMORY</div>
@@ -377,8 +515,15 @@ function BoardPage(props: {
 
       <div className="contact-layout">
         <aside className="contact-list">
-          {props.contacts.length === 0 && <p className="empty">暂无联系人。若已有历史记录，请重启 FastAPI 后端。</p>}
-          {props.contacts.map((contact) => (
+          <input
+            className="contact-search"
+            type="text"
+            placeholder="搜索联系人..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+          {filteredContacts.length === 0 && <p className="empty">{searchQuery ? "无匹配联系人" : "暂无联系人。若已有历史记录，请重启 FastAPI 后端。"}</p>}
+          {filteredContacts.map((contact) => (
             <button
               className={contact.contact_id === props.selectedId ? "contact-card active" : "contact-card"}
               key={contact.contact_id}

@@ -1,102 +1,170 @@
-# 社交策略数字分身 v1
+# 社交策略数字分身 v2
 
-结论：这是“本地建议器 + RAG 记忆库 + 草稿生成器 + Bumble 自动发送 Agent”。
+本地运行的 AI 社交助手：RAG 记忆库 + 结构化画像 + 草稿生成器 + 多平台自动回复 Agent（Bumble 网页版 + 探探/牵手 Android 真机）。
 
-## 功能
-- 读取 `all_chapters.json`，全量学习所有 A 端回复，生成知识覆盖报告，索引可追踪案例。
-- 使用 LanceDB 做案例检索，SQLite 区分联系人、渠道、会话和消息。
-- 使用 FastAPI 提供 API，Vite React 提供本地调试/操作控制台。
-- 支持上传社交主页截图或粘贴主页文字，自动生成结构化联系人画像。
-- 每轮对话会自动抽取可用信息，补全联系人画像并保留证据。
-- 默认模型为 `qwen3.7-plus`，`qwen3.7-max` 只保留为高级备用配置。
-- 回复前做风格审查，压制长段落、AI 腔、讨好、乱开玩笑、比喻、连续问句。
+---
 
-## 运行
+## 功能概览
+
+- **RAG 知识库**：读取 `all_chapters.json` 索引所有策略案例，LanceDB 向量检索，每次生成前召回相关案例。
+- **结构化联系人画像**：自动从对话和主页文字提取年龄/职业/爱好/性格/恋爱意图等字段，存入 SQLite，持续补全。
+- **草稿生成**：场景识别 → 沟通技术选择 → RAG 召回 → LLM 生成 → 风格审查（去 AI 腔、压制问句/讨好/比喻），最多重写两次。
+- **Bumble Agent**：Playwright 自动化，扫描 `Your move` 联系人，抓取 profile，逐条回复待回复消息，自动发送。
+- **探探/牵手 Android Agent**：ADB + uiautomator2，手机真机无人值守，自动检测未读消息，抓取完整画像，自动发送回复。
+
+---
+
+## 环境要求
+
+- Python 3.9+
+- Node.js 18+（前端）
+- ADB（Android 真机 Agent）
+- 阿里云 DashScope API Key（LLM 调用）
+
+---
+
+## 安装
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+pip install -U pip
+pip install -r requirements.txt
+
+# Bumble Agent 需要 Playwright
+python -m playwright install chromium
 ```
 
-`.env` 示例：
+`.env`：
 ```bash
 DASHSCOPE_API_KEY=你的Key
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-DECISION_MODEL=qwen3.7-plus
 REPLY_MODEL=qwen3.7-plus
+DECISION_MODEL=qwen3.7-plus
 CHEAP_MODEL=qwen3.6-flash
 PREMIUM_MODEL=qwen3.7-max
 PROFILE_VISION_MODEL=qwen3-vl-plus
 PROFILE_OCR_MODEL=qwen-vl-ocr-latest
 AUTO_SEND_ENABLED=true
-BROWSER_AGENT_TARGET_URL=
-BROWSER_AGENT_POLL_SECONDS=5
+ANDROID_AUTO_SEND_ENABLED=true
 BUMBLE_TARGET_URL=https://eu1.bumble.com/app/connections
 BUMBLE_POLL_SECONDS=5
 BUMBLE_USER_DATA_DIR=./browser_profiles/bumble
 ```
 
-启动 FastAPI：
+---
+
+## 启动
+
 ```bash
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
+# 启动后端（含前端静态托管）
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+# 前端开发模式（独立热重载）
+cd frontend && npm install && npm run dev
 ```
 
-启动前端开发界面：
+控制台：
+- `http://localhost:8000/about` — 产品介绍
+- `http://localhost:8000/agent` — Bumble / Android Agent 控制台
+- `http://localhost:8000/board` — 联系人看板、画像、消息记录
+
+---
+
+## Android Agent（探探/牵手）
+
+### 前提
+
+1. 手机通过 USB 连接 Mac，开启 USB 调试
+2. `adb devices` 能看到设备
+3. 锁屏设置为"滑动解锁"或"无"（否则屏幕亮起后仍无法操作）
+
+### 启动
+
 ```bash
-cd frontend
-npm install
-npm run dev
+# 启动 Agent，自动发送
+curl -X POST http://localhost:8000/agent/android/tantan/run \
+  -H "Content-Type: application/json" \
+  -d '{"auto_send_enabled": true}'
+
+# 查看状态和日志
+curl http://localhost:8000/agent/android/tantan/status
+
+# 停止
+curl -X POST http://localhost:8000/agent/android/tantan/stop
 ```
 
-构建前端并交给 FastAPI 托管：
-```bash
-cd frontend
-npm run build
-cd ..
-python -m uvicorn app:app --host 127.0.0.1 --port 8000
+### 运行流程
+
+```
+CONNECTING_ADB → LAUNCHING_APP → APP_READY → SCANNING_CONTACTS（循环）
+  → CONTACT_FOUND → CONTACT_OPENED
+  → FETCHING_PROFILE（画像字段<3时）或 PROFILE_SKIPPED（已够）
+  → MESSAGES_READ → PENDING_GROUP_FOUND → DRAFTING → DRAFTED → SENT
 ```
 
-控制台页面：
-- `http://127.0.0.1:8000/about`：产品介绍和使用方法
-- `http://127.0.0.1:8000/agent`：Bumble 浏览器 Agent 启停和状态日志
-- `http://127.0.0.1:8000/board`：联系人看板、画像、消息记录和 AI 回复策略
+### 未读检测逻辑（双重）
 
-开发模式也可以使用：
+1. **小红点**：`conversation_item_red_dot` 存在 → 处理
+2. **预览变化**：无小红点但预览文字与上次处理时不同 → 也进去检查
+
+小红点点进去后消失，所以不能只靠小红点。
+
+### 画像抓取
+
+- 点消息气泡旁左侧头像（`profile_avatar_layout`）进入 profile 页
+- 先滚到顶部，再向下滚动（最多 8 屏，连续 2 屏无新内容停止）
+- 只读 `profile_view_rv` 容器内的文字，避免背景聊天列表污染
+- 跨屏全局去重，LLM 从中提取结构化字段（年龄/职业/爱好/性格/恋爱意图等）
+
+### 消息读取
+
+- 遍历 `content_wrapper` 节点，用 `profile_image` 的水平位置判断 in/out
+- 文字/表情/图片/媒体消息全部记录（非文字记为 `[表情]`/`[图片/媒体]`）
+- 系统匹配消息（"hi，我们可以聊天啦！"等）自动过滤，不进消息记录和待回复队列
+
+### 回复逻辑
+
+- `extract_pending_incoming_group`：取最后一条 out 消息之后的所有 in 消息
+- 每条 in 消息生成一条草稿，顺序发送
+- SHA-256 哈希去重，7 天内已发送过的消息不重复生成
+
+### 数据存储
+
+| 角色 | 含义 |
+|---|---|
+| `user` | 对方发来的消息 |
+| `draft` | bot 生成草稿（待发送） |
+| `sent` | 已成功发送 |
+
+---
+
+## Bumble Agent
+
 ```bash
-cd frontend
-npm run dev
+# 启动
+curl -X POST http://localhost:8000/agent/bumble/run \
+  -H "Content-Type: application/json" \
+  -d '{"auto_send_enabled": true, "poll_seconds": 5}'
+
+# 状态
+curl http://localhost:8000/agent/bumble/status
+
+# 停止
+curl -X POST http://localhost:8000/agent/bumble/stop
 ```
 
-## API
-健康检查：
-```bash
-curl http://localhost:8000/health
-```
+运行时输入框会显示阶段提示：`正在读取 profile…` → `正在分析对话…` → `正在 RAG 检索…` → `正在生成第 N 句…` → 草稿填入。
 
-知识覆盖报告：
-```bash
-curl http://localhost:8000/knowledge/report
-```
+---
+
+## 手动 API
 
 分析联系人主页：
 ```bash
 curl -X POST http://localhost:8000/contacts/alice/profile/analyze \
   -F 'profile_text=身高168cm，水瓶座，硕士，杭州，做金融，喜欢音乐旅行'
 ```
-
-读取联系人画像：
-```bash
-curl http://localhost:8000/contacts/alice/profile
-```
-
-联系人看板：
-```bash
-curl http://localhost:8000/contacts
-curl http://localhost:8000/contacts/alice
-```
-
-前端联系人看板会优先展示可读信息：隐藏 Bumble 原始长 ID，过滤 `photo_urls`、图片链接和 `euri` 原始参数，画像字段显示为中文标签。
 
 生成草稿：
 ```bash
@@ -107,97 +175,47 @@ curl -X POST http://localhost:8000/draft \
     "channel": "manual",
     "message": "最近真的好累",
     "contact_identity": "朋友",
-    "contact_profile": "朋友，工作压力大",
     "relationship_stage": "熟悉",
-    "recent_emotion": "疲惫",
-    "interaction_frequency": "每周几次",
-    "preferences": "喜欢短句，不喜欢说教"
+    "recent_emotion": "疲惫"
   }'
 ```
 
-返回包含：
-- `draft`：只生成草稿，不发送
-- `technique`：本轮使用的沟通技术
-- `scenario`：场景识别
-- `retrieved_cases`：召回案例
-- `conversation_id`：独立会话 ID
-- `style_issues`：风格审查结果
-- `profile_updates`：本轮对话自动补全/更新的画像信息
+返回：`draft` / `technique` / `scenario` / `retrieved_cases` / `style_issues` / `profile_updates`
 
-## Bumble Agent 使用
-结论：Bumble Agent 默认自动发送；关闭“自动发送消息”时只生成草稿并填入输入框。
-
-首次运行前安装浏览器驱动：
+读取画像：
 ```bash
-python -m playwright install chromium
+curl http://localhost:8000/contacts/alice/profile
+curl http://localhost:8000/contacts
 ```
 
-启动服务后运行 Bumble Agent：
-```bash
-curl -X POST http://127.0.0.1:8000/agent/bumble/run \
-  -H "Content-Type: application/json" \
-  -d '{
-    "target_url": "https://eu1.bumble.com/app/connections",
-    "auto_send_enabled": true,
-    "poll_seconds": 5
-  }'
-```
-
-查看状态：
-```bash
-curl http://127.0.0.1:8000/agent/bumble/status
-```
-
-停止 Agent：
-```bash
-curl -X POST http://127.0.0.1:8000/agent/bumble/stop
-```
-
-运行过程会在 Bumble 输入框显示阶段提示：
-- `正在读取 profile 生成画像中，请等待……`
-- `正在分析对话中，请等待……`
-- `正在数据检索 RAG 中，请等待……`
-- `正在生成第 1/3 句回复，请等待……`
-- 生成完成后用草稿替代提示文字。
-
-自动发送需要同时满足两个条件：
-- `.env` 中 `AUTO_SEND_ENABLED=true`
-- 启动 Agent 时 `auto_send_enabled=true`
-
-`Your move`、`your turn` 和 `轮到您了` 都会被识别为同一种待回复状态。
+---
 
 ## 工作原理
-结论：系统是“结构化画像 + 会话记忆 + RAG 案例 + 风格审查”的草稿生成链路。
 
-流程：
-1. 读取联系人、消息和 profile DOM。
-2. 用 SQLite 保存联系人、会话、消息、画像字段和证据。
-3. 从 `all_chapters.json` 和 `persona_dialogues/*.json` 建立 LanceDB 案例索引。
-4. 每轮先识别场景和关系状态，再选择沟通技术。
-5. 用 RAG 召回策略案例、自然对话案例和人物关系案例。
-6. 调用模型生成短句草稿。
-7. 做风格审查，必要时重写或回退到自然样本。
+1. 识别场景（陌生人开场 / 日常互动 / 情绪支持 / 约见面等）
+2. 根据历史技术和当前场景选择沟通技术
+3. RAG 召回策略案例（annotated_strategy）、自然对话案例（natural_dialogue）、人物关系案例（persona_dialogue）
+4. LLM 生成 4–18 字中文短句草稿
+5. 风格审查：压制 AI 腔、长段、连续问句、讨好、比喻。不通过则重写，最多两次；最终回退到自然样本
 
-性能机制：
-- RAG 本地检索通常不是主要慢点，主要耗时来自远端 LLM 调用。
-- 当前 Bumble 对待回复消息逐条生成，质量稳定但慢。
-- 更快方案是同一 pending group 只做一次分析、一次 RAG、一次模型生成，直接返回多句草稿。
-- `draft_cache` 记录已生成但未发送的草稿；`sent_messages` 只记录已经真实按 Enter 发送的消息。
-- 如果页面仍显示 `Your move`、最新消息仍是对方 `in`、且没有我方新 `out`，Agent 会复用缓存草稿或从历史草稿恢复后继续发送。
-- 每轮会扫描所有 `Your move` 联系人，处理完一个后继续处理下一个。
+---
 
-## 数据入口
-`all_chapters.json` 负责策略库。所有 A 端回复都会入库：
-- `annotated_strategy`：带 `thinking` 和 `summary`，用于学习策略解释。
-- `natural_dialogue`：没有 `thinking/summary`，用于学习真人语气、节奏和上下文接法。
+## 知识库格式
 
-当前覆盖目标：
-- `total_a_replies = 178`
-- `annotated_strategy = 53`
-- `natural_dialogue = 125`
-- `vector_rows = 178`
+`all_chapters.json`（策略案例）：
+```json
+[
+  {
+    "context_3": "对方说的话",
+    "reply": "我的回复",
+    "thinking": "为什么这么回",
+    "summary": "策略摘要",
+    "reply_style": "克制"
+  }
+]
+```
 
-额外人物/关系对话放到 `persona_dialogues/*.json`，格式：
+`persona_dialogues/*.json`（人物关系案例）：
 ```json
 [
   {
@@ -212,49 +230,31 @@ curl -X POST http://127.0.0.1:8000/agent/bumble/stop
 ]
 ```
 
+---
+
 ## 架构
-- `app.py`：FastAPI 服务入口
-- `frontend/`：Vite React 本地调试/操作控制台
-- `social_twin/knowledge.py`：知识摄取与覆盖报告
-- `social_twin/vector_store.py`：LanceDB 检索
-- `social_twin/memory.py`：SQLite 多联系人会话记忆
-- `social_twin/service.py`：场景识别、策略选择、案例检索、草稿生成
-- `social_twin/style.py`：去 AI 味风格审查
-- `social_twin/connectors.py`：手动、API、浏览器 Agent 接入边界
-- `social_twin/profile.py`：主页截图/文字画像分析与对话画像更新
 
-## 浏览器 Agent
-第一版支持网页自动化边界：打开网页、查找未读消息、生成草稿、填入输入框、点击发送。
-
-全自动发送受 `.env` 中 `AUTO_SEND_ENABLED` 控制。启用前需要安装浏览器驱动：
-
-```bash
-python -m playwright install chromium
+```
+app.py                      FastAPI 服务入口
+frontend/                   Vite React 控制台
+social_twin/
+  service.py                核心链路：场景→技术→RAG→生成→审查
+  memory.py                 SQLite：联系人/会话/消息/画像
+  profile.py                画像提取（规则+LLM）
+  vector_store.py           LanceDB 案例检索
+  style.py                  风格审查
+  llm.py                    LLM 调用封装
+  android_base.py           Android Agent 基类（线程/状态/消息读写）
+  android_apps/tantan.py    探探/牵手连接器
+  bumble.py                 Bumble 连接器（Playwright）
+  connectors.py             浏览器通用 Agent
 ```
 
-桌面 App 和手机自动化暂不实现。
-
-## 最近更新
-- 联系人看板改为可读展示，隐藏 Bumble 原始长 ID 和图片 URL。
-- 前端控制台拆成 `/about`、`/agent`、`/board` 三个路由页。
-- 弃用 Gradio，新增 Vite React 前端控制台。
-- 新增联系人看板接口 `/contacts` 和 `/contacts/{contact_id}`。
-- 新增 FastAPI 服务入口和 Bumble 专用 Agent。
-- 新增联系人画像分析、画像证据库和对话画像自动更新。
-- 新增 `draft_cache` 草稿缓存，生成草稿不再等于已发送。
-- `sent_messages` 只在按 Enter 成功发送后写入，避免旧草稿被误判为已处理。
-- Bumble Agent 支持按联系人独立状态、读取 profile、识别待回复消息组、填入或自动发送草稿。
-- Bumble Agent 输入框会显示真实阶段提示：profile、分析、RAG、逐句生成。
-- 修复 `SentenceTransformer.encode` 参数兼容问题，避免 `Prompt name 'True'`。
-- 已缓存未发送草稿在页面仍为 `Your move` 时会被恢复并发送。
-- 每轮扫描全部 `Your move` 联系人，当前联系人处理后继续处理下一个联系人。
-- 新增状态日志 `DRAFT_CACHED`、`SENT_BY_ENTER`、`SKIPPED_ALREADY_SENT`、`NO_UNSENT_DRAFT`。
-- 草稿生成失败不写入已发送消息，失败消息可重试。
-- 测试替身不再强依赖真实 SQLite memory，单元测试可隔离 Bumble 状态逻辑。
+---
 
 ## 验证
+
 ```bash
-python3 -m py_compile app.py social_twin/*.py
-python3 -m unittest
+python3 -m py_compile app.py social_twin/*.py social_twin/android_apps/*.py
 cd frontend && npm run build
 ```

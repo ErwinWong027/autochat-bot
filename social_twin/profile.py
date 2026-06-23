@@ -58,7 +58,7 @@ class ProfileAnalyzer:
                     model=self.settings.reply_model,
                     messages=[{"role": "user", "content": self._prompt(text)}],
                     temperature=0.1,
-                    max_tokens=900,
+                    max_tokens=2000,
                 )
                 return ProfileAnalysis(updates=self._normalize_llm_updates(raw, source), raw=raw)
             except Exception:

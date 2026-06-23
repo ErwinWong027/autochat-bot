@@ -55,6 +55,8 @@ class LLMClient:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
+    # Strip qwen3 / reasoning-model <think>...</think> blocks before parsing
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
