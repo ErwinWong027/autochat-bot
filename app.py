@@ -16,10 +16,7 @@ from social_twin.service import DigitalTwinService, DraftRequest
 app = FastAPI(title="Social Strategy Digital Twin", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-    ],
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,9 +40,15 @@ class SPAStaticFiles(StaticFiles):
 class DraftIn(BaseModel):
     contact_id: str = Field(..., min_length=1)
     message: str = Field(..., min_length=1)
+    thread_id: str = ""
+    platform: str = ""
     channel: str = "manual"
     conversation_id: Optional[str] = None
     message_id: str = ""
+    extra_context: str = ""
+    pending_group_context: str = ""
+    memory_context: str = ""
+    profile_context: str = ""
     contact_profile: str = ""
     contact_identity: str = ""
     relationship_stage: str = ""
@@ -117,6 +120,11 @@ def list_contacts() -> dict:
 @app.get("/contacts/{contact_id}")
 def contact_detail(contact_id: str) -> dict:
     return service.memory.get_contact_detail(contact_id)
+
+
+@app.get("/contacts/{contact_id}/debug")
+def contact_debug(contact_id: str) -> dict:
+    return {"last_llm_prompt": service.get_last_llm_prompt(contact_id)}
 
 
 @app.post("/draft")

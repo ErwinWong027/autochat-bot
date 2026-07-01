@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import heroCharacter from "./assets/hero-character.png";
 import {
   AndroidRunPayload,
   AndroidStatus,
   BumbleStatus,
   ContactDetail,
+  ProfileField,
   ContactSummary,
   DraftResult,
   createDraft,
   getAndroidStatus,
   getBumbleStatus,
   getContact,
+  getContactDebug,
   getContacts,
   startAndroid,
   startBumble,
@@ -61,6 +63,19 @@ function shortContactId(contactId: string) {
   return `${clean.slice(0, 6)}...${clean.slice(-4)}`;
 }
 
+function contactPlatform(c: ContactSummary): "bumble" | "tantan" | "other" {
+  const ch = (c.channel || "").toLowerCase();
+  if (ch === "bumble" || c.contact_id.startsWith("bumble:")) return "bumble";
+  if (ch === "tantan" || ch === "qianshou") return "tantan";
+  return "other";
+}
+
+function platformLabel(key: "bumble" | "tantan" | "other") {
+  if (key === "bumble") return "Bumble";
+  if (key === "tantan") return "探探";
+  return "其他";
+}
+
 function readableProfile(profile?: string, fallback?: string) {
   const raw = (profile || fallback || "").trim();
   if (!raw) return "暂无简介";
@@ -75,7 +90,10 @@ function readableProfile(profile?: string, fallback?: string) {
 }
 
 const fieldLabels: Record<string, string> = {
+  about_me: "关于我",
   age: "年龄",
+  company: "公司",
+  compatibility_points: "契合点",
   bio: "简介",
   dating_intentions: "关系意图",
   drinking: "饮酒",
@@ -85,13 +103,36 @@ const fieldLabels: Record<string, string> = {
   gender: "性别",
   height: "身高",
   hometown: "家乡",
+  interests_hobbies: "兴趣爱好",
   job: "工作",
   location: "位置",
+  name: "名字",
+  personality_traits: "性格特征",
   platform_name: "平台名",
   profile_prompts: "主页问答",
+  raw_evidence: "原始证据",
+  school: "学校",
   zodiac: "星座",
   hobbies: "兴趣"
 };
+
+const fieldAliases: Record<string, string> = {
+  bio: "about_me",
+  hobbies: "interests_hobbies",
+  interest_tags: "interests_hobbies",
+  personality: "personality_traits",
+  platform_name: "name"
+};
+
+const profileSections: Array<{ title: string; fields: string[] }> = [
+  { title: "基本信息", fields: ["name", "age", "height", "education", "job", "company", "school", "zodiac", "location", "hometown"] },
+  { title: "关于我", fields: ["about_me"] },
+  { title: "性格特征", fields: ["personality_traits"] },
+  { title: "兴趣爱好", fields: ["interests_hobbies"] },
+  { title: "主页问答", fields: ["profile_prompts"] },
+  { title: "契合点", fields: ["compatibility_points"] },
+  { title: "原始证据", fields: ["raw_evidence"] }
+];
 
 function readableFieldValue(field: string, value: string) {
   if (!value) return "";
@@ -106,12 +147,33 @@ function readableFieldValue(field: string, value: string) {
   return value.replace(/；/g, " · ").slice(0, 220);
 }
 
-function visibleProfileFields(detail: ContactDetail | null) {
-  return Object.values(detail?.fields || {})
-    .filter((field) => field.field !== "photo_urls")
-    .filter((field) => !field.value.includes("https://"))
-    .filter((field) => !field.value.includes("euri="))
-    .slice(0, 12);
+function readableJson(value: unknown) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizedProfileFields(detail: ContactDetail | null) {
+  const result: Record<string, ProfileField> = {};
+  Object.values(detail?.fields || {}).forEach((field) => {
+    if (!field.value || field.value.includes("euri=")) return;
+    const normalized = fieldAliases[field.field] || field.field;
+    if (normalized === "photo_urls" || normalized === "photo_description") return;
+    const current = result[normalized];
+    const next = { ...field, field: normalized };
+    if (!current || next.confidence >= current.confidence) {
+      result[normalized] = next;
+    }
+  });
+  return result;
+}
+
+function contactDetailThreadId(detail: ContactDetail | null) {
+  return detail?.thread?.thread_id || detail?.conversations?.[0]?.conversation_id || "";
 }
 
 export default function App() {
@@ -120,6 +182,8 @@ export default function App() {
   const [contacts, setContacts] = useState<ContactSummary[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState<ContactDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const detailRequestId = useRef(0);
   const [status, setStatus] = useState<BumbleStatus | null>(null);
   const [targetUrl, setTargetUrl] = useState("https://eu1.bumble.com/app/connections");
   const [autoSend, setAutoSend] = useState(true);
@@ -129,7 +193,7 @@ export default function App() {
   const [draftResult, setDraftResult] = useState<DraftResult | null>(null);
   const [error, setError] = useState("");
   const [selectedAndroidApp, setSelectedAndroidApp] = useState<AndroidAppKey>("tantan");
-  const [androidAdbAddress, setAndroidAdbAddress] = useState("127.0.0.1:7555");
+  const [androidAdbAddress, setAndroidAdbAddress] = useState("");
   const [androidAutoSend, setAndroidAutoSend] = useState(true);
   const [androidPollSeconds, setAndroidPollSeconds] = useState(8);
   const [androidStatuses, setAndroidStatuses] = useState<Record<AndroidAppKey, AndroidStatus | null>>(
@@ -141,13 +205,31 @@ export default function App() {
     setRoute(nextRoute);
   }
 
+  async function loadContactDetail(contactId: string, clearCurrent = true) {
+    const requestId = detailRequestId.current + 1;
+    detailRequestId.current = requestId;
+    if (clearCurrent) setDetail(null);
+    if (!contactId) {
+      setDetail(null);
+      setDetailLoading(false);
+      return;
+    }
+    setDetailLoading(true);
+    try {
+      const nextDetail = await getContact(contactId);
+      if (detailRequestId.current === requestId) setDetail(nextDetail);
+    } finally {
+      if (detailRequestId.current === requestId) setDetailLoading(false);
+    }
+  }
+
   async function refreshContacts(nextSelectedId = selectedId) {
     const data = await getContacts();
     setOverview(data.summary);
     setContacts(data.contacts);
     const contactId = nextSelectedId || data.contacts.find((item) => item.message_count > 0)?.contact_id || data.contacts[0]?.contact_id || "";
     setSelectedId(contactId);
-    setDetail(contactId ? await getContact(contactId) : null);
+    await loadContactDetail(contactId, contactId !== selectedId);
   }
 
   async function refreshStatus() {
@@ -214,10 +296,11 @@ export default function App() {
     () => contacts.find((item) => item.contact_id === selectedId),
     [contacts, selectedId]
   );
+  const selectedDetail = contactDetailThreadId(detail) === selectedId ? detail : null;
 
   async function selectContact(contactId: string) {
     setSelectedId(contactId);
-    setDetail(await getContact(contactId));
+    await loadContactDetail(contactId);
     setDraftResult(null);
   }
 
@@ -297,7 +380,8 @@ export default function App() {
           contacts={contacts}
           selectedId={selectedId}
           selectedContact={selectedContact}
-          detail={detail}
+          detail={selectedDetail}
+          detailLoading={detailLoading}
           draftInput={draftInput}
           draftResult={draftResult}
           setDraftInput={setDraftInput}
@@ -483,12 +567,87 @@ function AgentPage(props: {
   );
 }
 
+type ModalMode = "messages" | "profile" | "llm" | null;
+
+const LLM_PROMPT_BLOCKS: Array<{ key: string; label: string; bg: string; color: string }> = [
+  { key: "profile_text_analysis", label: "① Profile 文本解析", bg: "var(--pink)", color: "var(--ink)" },
+  { key: "profile_image_analysis", label: "② Profile 图片解析", bg: "var(--pink)", color: "var(--ink)" },
+  { key: "memory_update", label: "③ 长期记忆更新", bg: "var(--purple)", color: "var(--paper)" },
+  { key: "technique_decision", label: "④ 技术选择", bg: "var(--purple)", color: "var(--paper)" },
+  { key: "reply_generation", label: "⑤ 回复生成", bg: "var(--acid)", color: "var(--ink)" },
+  { key: "reply_rewrite", label: "⑥ 回复改写（质检失败时触发）", bg: "var(--acid)", color: "var(--ink)" },
+];
+
+function checkProfileBeforeMemoryOrder(prompts: Record<string, { prompt: string; model: string; at: string }>): string | null {
+  const pa = prompts["profile_text_analysis"];
+  const mu = prompts["memory_update"];
+  if (!pa || !mu) return null;
+  if (pa.at > mu.at) {
+    return `排序违规：profile 解析（${pa.at.slice(0, 16)}）晚于记忆更新（${mu.at.slice(0, 16)}）`;
+  }
+  return null;
+}
+
+function LlmPromptsModal({ contactName, prompts, onClose }: {
+  contactName: string;
+  prompts: Record<string, { prompt: string; model: string; at: string }>;
+  onClose: () => void;
+}) {
+  const hasAny = Object.keys(prompts).length > 0;
+  const orderError = checkProfileBeforeMemoryOrder(prompts);
+  return (
+    <Modal title={`LLM 输入 · ${contactName}`} onClose={onClose}>
+      {orderError && (
+        <div style={{ background: "#ff2d2d", color: "#fff", padding: "10px 14px", marginBottom: 16, fontWeight: 700, fontSize: 13, borderRadius: 4 }}>
+          ⚠ {orderError}
+        </div>
+      )}
+      {!hasAny && (
+        <p style={{ color: "var(--paper)" }}>暂无记录。Agent 为该联系人触发相应动作后自动写入。</p>
+      )}
+      {LLM_PROMPT_BLOCKS.map(({ key, label, bg, color }) => {
+        const entry = prompts[key];
+        if (!entry) return null;
+        return (
+          <div key={key} style={{ marginBottom: 24 }}>
+            <div style={{ padding: "8px 12px", background: bg, color, fontSize: 12, fontWeight: 950, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 8, display: "flex", justifyContent: "space-between" }}>
+              <span>{label}</span>
+              <span style={{ opacity: 0.7 }}>{entry.model} · {entry.at?.slice(0, 16)}</span>
+            </div>
+            <pre>{entry.prompt}</pre>
+          </div>
+        );
+      })}
+    </Modal>
+  );
+}
+
+function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) { if (e.key === "Escape") onClose(); }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{title}</h3>
+          <button onClick={onClose}>✕ 关闭</button>
+        </div>
+        <div className="modal-body">{children}</div>
+      </div>
+    </div>
+  );
+}
+
 function BoardPage(props: {
   overview: Overview;
   contacts: ContactSummary[];
   selectedId: string;
   selectedContact?: ContactSummary;
   detail: ContactDetail | null;
+  detailLoading: boolean;
   draftInput: string;
   draftResult: DraftResult | null;
   setDraftInput: (value: string) => void;
@@ -497,11 +656,32 @@ function BoardPage(props: {
   handleDraft: () => void;
 }) {
   const [searchQuery, setSearchQuery] = useState("");
-  const filteredContacts = searchQuery.trim()
-    ? props.contacts.filter((c) =>
-        (c.display_name || c.contact_id || "").toLowerCase().includes(searchQuery.toLowerCase())
-      )
-    : props.contacts;
+  const [modal, setModal] = useState<ModalMode>(null);
+  const [platformFilter, setPlatformFilter] = useState<"all" | "bumble" | "tantan" | "other">("all");
+  const [detailTab, setDetailTab] = useState<"recent" | "profile" | "memory" | "operations">("recent");
+
+  useEffect(() => {
+    setModal(null);
+    setDetailTab("recent");
+  }, [props.selectedId]);
+
+  const platformsPresent = useMemo(() => {
+    const set = new Set<string>();
+    props.contacts.forEach((c) => set.add(contactPlatform(c)));
+    return set;
+  }, [props.contacts]);
+
+  const filteredContacts = useMemo(() => {
+    let list = props.contacts;
+    if (platformFilter !== "all") list = list.filter((c) => contactPlatform(c) === platformFilter);
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      list = list.filter((c) => (c.display_name || c.contact_id || "").toLowerCase().includes(q));
+    }
+    return list;
+  }, [props.contacts, platformFilter, searchQuery]);
+
+  const normalizedFields = normalizedProfileFields(props.detail);
 
   return (
     <section className="page board-page">
@@ -514,7 +694,21 @@ function BoardPage(props: {
       </div>
 
       <div className="contact-layout">
+        {/* ── LEFT: contact list ── */}
         <aside className="contact-list">
+          <div className="platform-tabs">
+            {(["all", "bumble", "tantan", "other"] as const)
+              .filter((key) => key === "all" || platformsPresent.has(key))
+              .map((key) => (
+                <button
+                  key={key}
+                  className={platformFilter === key ? "active" : ""}
+                  onClick={() => setPlatformFilter(key)}
+                >
+                  {key === "all" ? "全部" : platformLabel(key)}
+                </button>
+              ))}
+          </div>
           <input
             className="contact-search"
             type="text"
@@ -522,80 +716,262 @@ function BoardPage(props: {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
-          {filteredContacts.length === 0 && <p className="empty">{searchQuery ? "无匹配联系人" : "暂无联系人。若已有历史记录，请重启 FastAPI 后端。"}</p>}
-          {filteredContacts.map((contact) => (
-            <button
-              className={contact.contact_id === props.selectedId ? "contact-card active" : "contact-card"}
-              key={contact.contact_id}
-              onClick={() => props.selectContact(contact.contact_id)}
-            >
-              <span className="contact-time">{formatTime(contact.last_message_at || contact.updated_at)}</span>
-              <strong>{contactName(contact)}</strong>
-              <small>{contact.channel || "bumble"} · {shortContactId(contact.contact_id)}</small>
-              <p>{readableProfile(contact.profile, contact.last_message)}</p>
-              <em>{contact.channel || "bumble"} · {contact.message_count} messages</em>
-            </button>
-          ))}
+          {filteredContacts.length === 0 && (
+            <p className="empty">{searchQuery ? "无匹配联系人" : "暂无联系人。若已有历史记录，请重启 FastAPI 后端。"}</p>
+          )}
+          {filteredContacts.map((contact) => {
+            const plat = contactPlatform(contact);
+            return (
+              <button
+                className={contact.contact_id === props.selectedId ? "contact-card active" : "contact-card"}
+                key={contact.contact_id}
+                onClick={() => props.selectContact(contact.contact_id)}
+              >
+                <div className="contact-card-header">
+                  <strong>{contactName(contact)}</strong>
+                  <span className="contact-time">{formatTime(contact.last_message_at || contact.updated_at)}</span>
+                </div>
+                <div className="contact-card-meta">
+                  <span className={`platform-badge platform-badge--${plat}`}>{platformLabel(plat)}</span>
+                  <small>{shortContactId(contact.contact_id)}</small>
+                  <small>· {contact.message_count} 条</small>
+                </div>
+                <p>{readableProfile(contact.profile, contact.last_message)}</p>
+              </button>
+            );
+          })}
         </aside>
 
+        {/* ── RIGHT: detail panel ── */}
         <div className="detail-panel">
           <header className="detail-head">
             <div>
-              <span>SELECTED CONTACT</span>
-              <h2>{contactName(props.selectedContact)}</h2>
-              <p>{props.selectedId ? `${props.selectedContact?.channel || "bumble"} · ${shortContactId(props.selectedId)}` : "NO CONTACT"}</p>
+              <span className="detail-kicker">SELECTED CONTACT</span>
+              <h2 className="detail-name">{contactName(props.selectedContact)}</h2>
+              <div className="detail-meta">
+                {props.selectedContact && (
+                  <span className={`platform-badge platform-badge--${contactPlatform(props.selectedContact)}`}>
+                    {platformLabel(contactPlatform(props.selectedContact))}
+                  </span>
+                )}
+                <span className="detail-id">{props.selectedId ? shortContactId(props.selectedId) : "NO CONTACT"}</span>
+              </div>
             </div>
             <button className="ghost" onClick={props.refresh}>REFRESH</button>
           </header>
 
-          <div className="profile-grid">
-            {visibleProfileFields(props.detail).map((field) => (
-              <div className="profile-pill" key={field.field}>
-                <span>{fieldLabels[field.field] || field.field}</span>
-                <b>{readableFieldValue(field.field, field.value)}</b>
-              </div>
+          {/* ── Tab nav ── */}
+          <div className="detail-tabs">
+            {(["recent", "profile", "memory", "operations"] as const).map((tab) => (
+              <button
+                key={tab}
+                className={detailTab === tab ? "active" : ""}
+                onClick={() => setDetailTab(tab)}
+              >
+                {tab === "recent"
+                  ? `近期${props.detail ? ` (${props.detail.messages.length})` : ""}`
+                  : tab === "profile" ? "画像"
+                  : tab === "memory" ? "记忆"
+                  : "操作"}
+              </button>
             ))}
-            {props.detail && Object.keys(props.detail.fields || {}).length === 0 && (
-              <p className="empty">暂无画像字段。Bumble Agent 读取 profile 后会自动补全。</p>
-            )}
           </div>
 
-          <div className="draft-box">
-            <textarea
-              value={props.draftInput}
-              onChange={(event) => props.setDraftInput(event.target.value)}
-              placeholder="在当前联系人下追加一条本地消息，并生成回复草稿"
-            />
-            <button onClick={props.handleDraft}>生成并写入记录</button>
-            {props.draftResult && (
-              <div className="draft-result">
-                <b>{props.draftResult.draft}</b>
-                <span>{props.draftResult.technique} / {props.draftResult.scenario}</span>
-                <p>{props.draftResult.decision_reason}</p>
-              </div>
-            )}
-          </div>
-
-          <div className="message-timeline">
-            {(props.detail?.messages || []).map((message) => (
-              <article className={`message-row ${message.role}`} key={message.id}>
-                <div>
-                  <span>{message.role}</span>
-                  <time>{formatTime(message.created_at)}</time>
+          {/* ── Tab: 近期 ── */}
+          {detailTab === "recent" && (
+            <div className="tab-content">
+              {props.detail?.pending_group && props.detail.pending_group.length > 0 && (
+                <div className="pending-group-box">
+                  <div className="pending-group-label">待处理消息组 · {props.detail.pending_group.length} 条未回复</div>
+                  {props.detail.pending_group.map((msg, i) => (
+                    <div key={i} className="pending-group-item">
+                      <span>{String(msg.role || "user")}</span>
+                      <p>{String(msg.content || "")}</p>
+                    </div>
+                  ))}
                 </div>
-                <p>{message.content}</p>
-                {(message.technique || message.decision_reason) && (
-                  <footer>
-                    <b>{message.technique || "strategy"}</b>
-                    <span>{message.decision_reason}</span>
-                  </footer>
+              )}
+              <div className="message-timeline">
+                {props.detailLoading && <p className="empty">加载中...</p>}
+                {!props.detailLoading && !props.detail && (
+                  <p className="empty">请从左侧选择联系人。</p>
                 )}
-              </article>
-            ))}
-            {props.detail && props.detail.messages.length === 0 && <p className="empty">暂无消息记录。</p>}
-          </div>
+                {(props.detail?.messages || []).slice(-10).map((message) => (
+                  <article className={`message-row ${message.role}`} key={message.id}>
+                    <div>
+                      <span>{message.role}</span>
+                      <time>{formatTime(message.created_at)}</time>
+                    </div>
+                    <p>{message.content}</p>
+                    {(message.technique || message.decision_reason) && (
+                      <footer>
+                        <b>{message.technique || "strategy"}</b>
+                        <span>{message.decision_reason}</span>
+                      </footer>
+                    )}
+                  </article>
+                ))}
+                {props.detail && props.detail.messages.length === 0 && (
+                  <p className="empty">暂无消息记录。</p>
+                )}
+              </div>
+              {props.detail && props.detail.messages.length > 0 && (
+                <button className="view-all-btn" onClick={() => setModal("messages")}>
+                  查看全部 {props.detail.messages.length} 条历史消息 →
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* ── Tab: 画像 ── */}
+          {detailTab === "profile" && (
+            <div className="tab-content">
+              <div className="profile-grid">
+                {profileSections.map((section) => {
+                  const sectionFields = section.fields.map((field) => normalizedFields[field]).filter(Boolean);
+                  return (
+                    <section className="profile-section" key={section.title}>
+                      <h3>{section.title}</h3>
+                      {sectionFields.length > 0 ? (
+                        <div className="profile-section-fields">
+                          {sectionFields.map((field) => {
+                            const label = fieldLabels[field.field] || field.field;
+                            const showLabel = section.fields.length > 1 || label !== section.title;
+                            return (
+                              <div className="profile-pill" key={field.field}>
+                                {showLabel && <span>{label}</span>}
+                                <b>{readableFieldValue(field.field, field.value)}</b>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="empty">{props.detailLoading ? "加载中" : "暂无"}</p>
+                      )}
+                    </section>
+                  );
+                })}
+                {props.detail && Object.keys(normalizedFields).length === 0 && (
+                  <p style={{ color: "var(--paper)", gridColumn: "1 / -1" }}>
+                    暂无画像字段。Bumble Agent 读取 profile 后会自动补全。
+                  </p>
+                )}
+              </div>
+              <button className="view-all-btn" onClick={() => setModal("profile")}>
+                查看原始 Profile 文本 →
+              </button>
+            </div>
+          )}
+
+          {/* ── Tab: 记忆 ── */}
+          {detailTab === "memory" && (
+            <div className="tab-content">
+              {!props.detail && <p className="empty">请从左侧选择联系人。</p>}
+              <div className="memory-grid">
+                <div className="memory-section">
+                  <h4>长期摘要 / working summary</h4>
+                  <p>{readableJson(props.detail?.memory?.working_summary) || "暂无"}</p>
+                </div>
+                <div className="memory-section">
+                  <h4>固定事实 / pinned facts</h4>
+                  <pre>{readableJson(props.detail?.memory?.pinned_facts) || "暂无"}</pre>
+                </div>
+                <div className="memory-section">
+                  <h4>偏好与禁忌 / preferences · taboos</h4>
+                  <pre>{readableJson({ preferences: props.detail?.memory?.preferences, taboos: props.detail?.memory?.taboos })}</pre>
+                </div>
+                <div className="memory-section">
+                  <h4>话题历史 / topic history</h4>
+                  <pre>{readableJson(props.detail?.memory?.topic_history) || "暂无"}</pre>
+                </div>
+                <div className="memory-section">
+                  <h4>回复历史 / reply history</h4>
+                  <pre>{readableJson(props.detail?.memory?.reply_history) || "暂无"}</pre>
+                </div>
+                <div className="memory-section">
+                  <h4>待处理消息组 / pending group</h4>
+                  <pre>{readableJson(props.detail?.pending_group) || "暂无"}</pre>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Tab: 操作 ── */}
+          {detailTab === "operations" && (
+            <div className="tab-content">
+              <div className="draft-box">
+                <div className="draft-box-label">追加消息并生成草稿</div>
+                <textarea
+                  value={props.draftInput}
+                  onChange={(event) => props.setDraftInput(event.target.value)}
+                  placeholder="输入联系人的最新消息，系统会生成 AI 回复草稿"
+                />
+                <button onClick={props.handleDraft}>生成并写入记录</button>
+                {props.draftResult && (
+                  <div className="draft-result">
+                    <b>{props.draftResult.draft}</b>
+                    <span>{props.draftResult.technique} / {props.draftResult.scenario}</span>
+                    <p>{props.draftResult.decision_reason}</p>
+                  </div>
+                )}
+              </div>
+              {(() => {
+                const orderErr = checkProfileBeforeMemoryOrder(props.detail?.last_llm_prompts ?? {});
+                return orderErr ? (
+                  <div style={{ background: "#ff2d2d", color: "#fff", padding: "8px 12px", marginTop: 12, fontWeight: 700, fontSize: 12, borderRadius: 4 }}>
+                    ⚠ {orderErr}
+                  </div>
+                ) : null;
+              })()}
+              <button className="view-all-btn" style={{ marginTop: 12 }} onClick={() => setModal("llm")}>
+                LLM 输入记录（{Object.keys(props.detail?.last_llm_prompts ?? {}).length} 个区块）→
+              </button>
+            </div>
+          )}
         </div>
       </div>
+
+      {/* ── Modals ── */}
+      {modal === "messages" && (
+        <Modal title={`历史消息 · ${contactName(props.selectedContact)} · 共 ${props.detail?.messages?.length ?? 0} 条`} onClose={() => setModal(null)}>
+          {(props.detail?.messages || []).map((message) => (
+            <article className={`message-row ${message.role}`} key={message.id} style={{ marginBottom: "12px" }}>
+              <div>
+                <span>{message.role}</span>
+                <time>{formatTime(message.created_at)}</time>
+              </div>
+              <code className="trace-id">trace {shortContactId(message.message_id || String(message.id))}</code>
+              <p>{message.content}</p>
+              {(message.technique || message.decision_reason) && (
+                <footer>
+                  <b>{message.technique || "strategy"}</b>
+                  <span>{message.decision_reason}</span>
+                </footer>
+              )}
+            </article>
+          ))}
+          {(!props.detail || props.detail.messages.length === 0) && (
+            <p style={{ color: "var(--paper)" }}>暂无消息记录。</p>
+          )}
+        </Modal>
+      )}
+
+      {modal === "profile" && (
+        <Modal title={`原始 Profile · ${contactName(props.selectedContact)}`} onClose={() => setModal(null)}>
+          {props.detail?.profile_text
+            ? <pre>{props.detail.profile_text}</pre>
+            : <p style={{ color: "var(--paper)" }}>尚未采集到原始 Profile 文本。Bumble Agent 打开联系人后会自动写入。</p>
+          }
+        </Modal>
+      )}
+
+      {modal === "llm" && (
+        <LlmPromptsModal
+          contactName={contactName(props.selectedContact)}
+          prompts={props.detail?.last_llm_prompts ?? {}}
+          onClose={() => setModal(null)}
+        />
+      )}
     </section>
   );
 }

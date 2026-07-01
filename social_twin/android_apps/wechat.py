@@ -76,7 +76,7 @@ class WeChatConnector(AndroidBaseConnector):
             pass
         return contacts
 
-    def _open_conversation(self, device, contact_id: str, name: str) -> bool:
+    def _open_conversation(self, device, contact_id: str, name: str, open_bounds: str | None = None) -> bool:
         # Try clicking the contact directly in the chat list
         try:
             item = device(resourceId=_CONTACT_NAME_ID, text=name)
@@ -87,9 +87,9 @@ class WeChatConnector(AndroidBaseConnector):
         except Exception:
             pass
         # Fall back to notification tap (most reliable for WeChat)
-        return super()._open_conversation(device, contact_id, name)
+        return super()._open_conversation(device, contact_id, name, open_bounds)
 
-    def _read_conversation(self, device, contact_id: str) -> list[AndroidMessage]:
+    def _read_conversation(self, device, contact_id: str, thread_id: str = "") -> list[AndroidMessage]:
         messages: list[AndroidMessage] = []
         try:
             screen_width = device.info.get("displayWidth", 1080)

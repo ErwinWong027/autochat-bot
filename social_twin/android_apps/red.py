@@ -41,7 +41,7 @@ class RedConnector(AndroidBaseConnector):
             pass
         return contacts
 
-    def _open_conversation(self, device, contact_id: str, name: str) -> bool:
+    def _open_conversation(self, device, contact_id: str, name: str, open_bounds: str | None = None) -> bool:
         try:
             item = device(resourceId=_CONTACT_NAME_ID, text=name)
             if item.exists(timeout=2):
@@ -50,9 +50,9 @@ class RedConnector(AndroidBaseConnector):
                 return True
         except Exception:
             pass
-        return super()._open_conversation(device, contact_id, name)
+        return super()._open_conversation(device, contact_id, name, open_bounds)
 
-    def _read_conversation(self, device, contact_id: str) -> list[AndroidMessage]:
+    def _read_conversation(self, device, contact_id: str, thread_id: str = "") -> list[AndroidMessage]:
         messages: list[AndroidMessage] = []
         try:
             screen_width = device.info.get("displayWidth", 1080)

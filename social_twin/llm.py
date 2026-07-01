@@ -18,13 +18,20 @@ class LLMClient:
         self.client = OpenAI(api_key=settings.dashscope_api_key, base_url=settings.dashscope_base_url, timeout=60.0)
 
     def chat(self, model: str, messages: list[dict[str, Any]], temperature: float, max_tokens: int) -> str:
-        resp = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        resp = self.client.chat.completions.create(**kwargs)
+        content = (resp.choices[0].message.content or "").strip()
+        if not content and "deepseek" in self.settings.dashscope_base_url.lower():
+            retry_kwargs = dict(kwargs)
+            retry_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            resp = self.client.chat.completions.create(**retry_kwargs)
+            content = (resp.choices[0].message.content or "").strip()
+        return content
 
     def chat_with_image(
         self,

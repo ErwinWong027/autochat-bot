@@ -24,6 +24,9 @@ export type Overview = {
 
 export type ContactSummary = {
   contact_id: string;
+  thread_id?: string;
+  platform?: string;
+  platform_contact_id?: string;
   display_name?: string;
   identity?: string;
   profile?: string;
@@ -36,6 +39,17 @@ export type ContactSummary = {
   reply_count: number;
   last_message?: string;
   last_message_at?: string;
+  memory_updated_at?: string;
+};
+
+export type ThreadSummary = {
+  thread_id: string;
+  platform: string;
+  platform_contact_id: string;
+  display_name?: string;
+  status?: string;
+  created_at?: string;
+  updated_at?: string;
 };
 
 export type ProfileField = {
@@ -61,11 +75,17 @@ export type Message = {
 
 export type ContactDetail = {
   contact: ContactSummary & Record<string, string | number | undefined>;
+  thread?: ThreadSummary;
   fields: Record<string, ProfileField>;
   evidence: Array<Record<string, string | number>>;
   conversations: Array<Record<string, string>>;
   messages: Message[];
+  memory?: Record<string, unknown>;
+  pending_group?: Array<Record<string, string | number>>;
   draft_cache: Array<Record<string, string>>;
+  profile_text?: string;
+  recent_messages_json?: string;
+  last_llm_prompts?: Record<string, { prompt: string; model: string; at: string }>;
 };
 
 export type ContactsResponse = {
@@ -100,8 +120,14 @@ export type BumbleStatus = {
 export type DraftPayload = {
   contact_id: string;
   message: string;
+  thread_id?: string;
+  platform?: string;
   channel: string;
   conversation_id?: string;
+  extra_context?: string;
+  pending_group_context?: string;
+  memory_context?: string;
+  profile_context?: string;
   contact_profile?: string;
   contact_identity?: string;
   relationship_stage?: string;
@@ -123,6 +149,10 @@ export function getContacts() {
 
 export function getContact(contactId: string) {
   return request<ContactDetail>(`/contacts/${encodeURIComponent(contactId)}`);
+}
+
+export function getContactDebug(contactId: string) {
+  return request<{ last_llm_prompt: string }>(`/contacts/${encodeURIComponent(contactId)}/debug`);
 }
 
 export function createDraft(payload: DraftPayload) {
