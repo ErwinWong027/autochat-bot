@@ -57,6 +57,9 @@ BUMBLE_USER_DATA_DIR=./browser_profiles/bumble
 ## 启动
 
 ```bash
+# 一键启动后端和前端开发服务
+./start.sh
+
 # 启动后端（含前端静态托管）
 uvicorn app:app --host 0.0.0.0 --port 8000
 
@@ -68,6 +71,10 @@ cd frontend && npm install && npm run dev
 - `http://localhost:8000/about` — 产品介绍
 - `http://localhost:8000/agent` — Bumble / Android Agent 控制台
 - `http://localhost:8000/board` — 联系人看板、画像、消息记录
+
+说明：
+- `start.sh` 会启动后端和前端；后端启动时会加载策略知识库、人物对话样本，并同步 LanceDB 向量索引。
+- `start.sh` 不会自动启动 Tantan/Bumble Agent；自动回复仍需在控制台点击启动，或调用下面的 Agent API。
 
 ---
 
@@ -106,7 +113,7 @@ CONNECTING_ADB → LAUNCHING_APP → APP_READY → SCANNING_CONTACTS（循环）
 ### 未读检测逻辑（双重）
 
 1. **小红点**：`conversation_item_red_dot` 存在 → 处理
-2. **预览变化**：无小红点但预览文字与上次处理时不同 → 也进去检查
+2. **系统欢迎语小红点**：`hi，我们可以聊天啦！` 等系统预览有小红点时也会进入会话检查
 
 小红点点进去后消失，所以不能只靠小红点。
 
@@ -122,11 +129,14 @@ CONNECTING_ADB → LAUNCHING_APP → APP_READY → SCANNING_CONTACTS（循环）
 - 遍历 `content_wrapper` 节点，用 `profile_image` 的水平位置判断 in/out
 - 文字/表情/图片/媒体消息全部记录（非文字记为 `[表情]`/`[图片/媒体]`）
 - 系统匹配消息（"hi，我们可以聊天啦！"等）自动过滤，不进消息记录和待回复队列
+- 如果聊天页读取到 0 条真实消息，Tantan 会走空线程 fallback，直接发送 `hiii`
+- 列表预览只作为非系统消息的兜底；系统欢迎语不会被当成 incoming
 
 ### 回复逻辑
 
 - `extract_pending_incoming_group`：取最后一条 out 消息之后的所有 in 消息
-- 每条 in 消息生成一条草稿，顺序发送
+- 对 pending group 生成回复并顺序发送
+- 双方尚无真实消息时，Tantan 使用 `empty_thread_fallback` 发送 `hiii`
 - SHA-256 哈希去重，7 天内已发送过的消息不重复生成
 
 ### 数据存储
